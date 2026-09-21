@@ -1,0 +1,123 @@
+# ==========================================================================
+# Python
+# ==========================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==========================================================================
+# Ambientes virtuais
+# ==========================================================================
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.python-version
+
+# ==========================================================================
+# Configuracoes e segredos
+# ==========================================================================
+.env
+.env.*
+!.env.example
+
+# ==========================================================================
+# Logs
+# ==========================================================================
+*.log
+logs/
+datasus.log
+
+# ==========================================================================
+# DuckDB / cache de dados DATASUS
+# ==========================================================================
+# Banks de grupos e bancos principais gerados em runtime.
+*.duckdb
+*.duckdb.wal
+*.wal
+
+# Diretorios de cache/spill do DuckDB.
+.spill/
+/tmp/
+/temp/
+# Diretorios de dados/cache gerados em runtime (ancorados na raiz).
+/cache/
+/colunas_cache/
+/parquet/
+
+# Indice de periodos e metadados gerados.
+*.duckdb.tmp
+
+# ==========================================================================
+# Backups temporarios de edicao (recuperacao de cache.py etc.)
+# ==========================================================================
+db/_backups/
+db/_disasm*.txt
+*.corrupted.bak
+*.recovered.bin
+*.bak
+*.orig
+*.rej
+*.tmp
+
+# ==========================================================================
+# Artefatos de build / distribuicao
+# ==========================================================================
+*.zip
+datasus_llm_app.zip
+
+# ==========================================================================
+# Arquivos temporarios de ferramentas/agentes
+# ==========================================================================
+# Apenas na RAIZ do projeto (padroes com "/" no inicio ancoram na raiz).
+# NAO usar "_*.py" sem ancora: isso ignoraria arquivos legitimos do codigo
+# como api/llm_service_parts/_constants.py.
+/_*.py
+/_*.ps1
+/_*.sh
+/_*.bat
+
+# ==========================================================================
+# Sistema operacional / editores
+# ==========================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ==========================================================================
+# Testes: NAO ignorar
+# ==========================================================================
+# A pasta test/ e os arquivos de teste do projeto DEVEM ser versionados.
+# Re-inclui os fontes de teste, mas MANTEM fora os caches/artefatos gerados
+# (por isso negamos __pycache__ e *.pyc explicitamente, ja que "!test/**"
+# os traria de volta).
+!test/
+!test/**
+!db/test_cid_identification.py
+# mas nunca versionar caches dentro dos testes
+test/__pycache__/
+*.pyc

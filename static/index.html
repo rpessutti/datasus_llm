@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DATASUS LLM</title>
+  <style>
+    :root { color-scheme: light; font-family: Georgia, serif; color: #173b3f; background: #f4efe6; }
+    body { max-width: 920px; margin: 0 auto; padding: 48px 22px; }
+    h1 { font-size: clamp(2.4rem, 7vw, 5.5rem); line-height: .9; letter-spacing: -.04em; margin: 0 0 18px; color: #0d5c63; }
+    p { font-family: system-ui, sans-serif; line-height: 1.5; }
+    .lead { max-width: 620px; font-size: 1.05rem; }
+    form { margin-top: 38px; display: grid; gap: 12px; }
+    textarea { min-height: 130px; resize: vertical; border: 2px solid #173b3f; border-radius: 6px; padding: 16px; font: 1rem system-ui, sans-serif; background: #fffdf8; }
+    button { justify-self: start; border: 0; border-radius: 4px; padding: 13px 20px; font: 700 .95rem system-ui, sans-serif; color: #fffdf8; background: #e05d3e; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    #status { margin-top: 28px; font-family: system-ui, sans-serif; color: #647477; }
+    #answer { margin-top: 12px; padding: 22px; white-space: pre-wrap; border-left: 5px solid #e05d3e; background: #fffdf8; font: 1rem/1.55 system-ui, sans-serif; min-height: 30px; }
+    #chart { max-width: 100%; height: auto; margin-top: 18px; border: 1px solid #d9d1c5; background: #fffdf8; }
+    #chart[hidden] { display: none; }
+    #results { margin-top: 18px; overflow-x: auto; background: #fffdf8; }
+    #results table { width: 100%; border-collapse: collapse; font: .9rem/1.4 system-ui, sans-serif; }
+    #results th, #results td { padding: 9px 10px; border: 1px solid #d9d1c5; text-align: left; white-space: nowrap; }
+    #results th { color: #fffdf8; background: #0d5c63; }
+    .meta { margin-top: 10px; font-size: .85rem; color: #647477; }
+    #duration { margin-top: 2px; font: 700 1.05rem system-ui, sans-serif; color: #0d5c63; }
+    .chart-selector { margin-top: 8px; padding: 14px 16px; border: 1px solid #d9d1c5; border-radius: 6px; background: #fffdf8; font-family: system-ui, sans-serif; }
+    .chart-selector legend { font-weight: 700; font-size: .9rem; color: #0d5c63; padding: 0 6px; }
+    .chart-types { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; }
+    .chart-types label { display: inline-flex; align-items: center; gap: 4px; font-size: .85rem; cursor: pointer; }
+    .chart-types input[type="checkbox"] { width: 15px; height: 15px; accent-color: #0d5c63; cursor: pointer; }
+    .chart-types input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
+    .chart-hint { font-size: .75rem; color: #647477; margin-top: 6px; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1> PoC - DATASUS <br>LLM</h1>
+  <p class="lead">Faça uma pergunta sobre os diagnosticos mapeados pelo DataSUS. O sistema consulta o cache DuckDB e usa um LLM para transformar a pergunta em uma consulta estatística auditável.</p>
+  <form id="ask-form">
+    <textarea id="question" required placeholder="Ex.: Quantos registros existem por ano para dengue?"></textarea>
+    <fieldset class="chart-selector">
+      <legend>Tipo de gráfico (opcional)</legend>
+      <div class="chart-types">
+        <label title="Distribuição circular de categorias"><input type="checkbox" value="pizza" name="tipo_grafico"> Pizza</label>
+        <label title="Pizza em formato de rosca"><input type="checkbox" value="donut" name="tipo_grafico"> Donut</label>
+        <label title="Barras na horizontal - bom para muitas categorias"><input type="checkbox" value="horizontal" name="tipo_grafico"> Barras horizontais</label>
+        <label title="Barras verticais - comparação entre categorias"><input type="checkbox" value="vertical" name="tipo_grafico"> Barras verticais</label>
+        <label title="Linha - evolução temporal ou tendência"><input type="checkbox" value="linha" name="tipo_grafico"> Linha</label>
+        <label title="Área preenchida sob a curva"><input type="checkbox" value="area" name="tipo_grafico"> Área</label>
+        <label title="Dispersão - correlação entre variáveis"><input type="checkbox" value="dispersao" name="tipo_grafico"> Dispersão</label>
+        <label title="Radar - comparação multidimensional"><input type="checkbox" value="radar" name="tipo_grafico"> Radar</label>
+      </div>
+      <div class="chart-hint">Marque até uma opção. Se não marcar nada, o sistema detecta automaticamente o melhor gráfico pela pergunta.</div>
+    </fieldset>
+    <button id="submit" type="submit">Consultar</button>
+    <div id="duration" aria-live="polite"></div>
+  </form>
+  <div id="status">Verificando o cache...</div>
+  <div id="answer" aria-live="polite"></div>
+  <img id="chart" alt="Gráfico de barras dos resultados da consulta" hidden>
+  <div id="results" hidden></div>
+  <div class="meta" id="meta"></div>
+  <script>
+    const status = document.querySelector('#status');
+    const answer = document.querySelector('#answer');
+    const results = document.querySelector('#results');
+    const chart = document.querySelector('#chart');
+    const meta = document.querySelector('#meta');
+    const duration = document.querySelector('#duration');
+    const button = document.querySelector('#submit');
+    async function loadStatus() {
+      const response = await fetch('/api/status');
+      const data = await response.json();
+      if (data.state === 'loading') {
+        status.textContent = 'Carregando o cache...';
+        setTimeout(() => loadStatus().catch(() => status.textContent = 'Cache ainda não inicializado.'), 1000);
+        return;
+      }
+      if (data.state === 'error') {
+        status.textContent = 'Erro ao carregar o cache: ' + data.error;
+        return;
+      }
+      const rowText = data.rows === null ? 'contagem indisponível' : data.rows.toLocaleString('pt-BR') + ' registro(s)';
+      status.textContent = data.files + ' arquivo(s) indexado(s), ' + rowText + '.';
+    }
+    document.querySelector('#ask-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const startedAt = performance.now();
+      button.disabled = true; status.textContent = 'Consultando...'; answer.textContent = ''; results.hidden = true; results.replaceChildren(); chart.hidden = true; chart.style.display = 'none'; chart.removeAttribute('src'); meta.textContent = ''; duration.textContent = '';
+      try {
+        // Captura o tipo de gráfico selecionado (se houver)
+        const checkedChartTypes = Array.from(document.querySelectorAll('.chart-selector input[name="tipo_grafico"]:checked'));
+        let tipoGrafico = null;
+        if (checkedChartTypes.length > 0) {
+          // Usa apenas o primeiro checkbox marcado (permite apenas um)
+          tipoGrafico = checkedChartTypes[0].value;
+        }
+        const payload = { question: document.querySelector('#question').value };
+        if (tipoGrafico) {
+          payload.tipo_grafico = tipoGrafico;
+        }
+        const response = await fetch('/api/ask', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Falha na consulta');
+        answer.textContent = data.answer;
+        renderResults(data.results || []);
+        if (data.chart && data.chart.startsWith('data:image/')) {
+          showChart(data.chart);
+        } else {
+          meta.textContent += '  Gráfico indisponível para este resultado.';
+        }
+        meta.textContent = (data.source || '') + (data.tipo_grafico ? '  Gráfico: ' + data.tipo_grafico : '') + (data.sql ? '  SQL: ' + data.sql : '');
+        duration.textContent = 'Tempo total da consulta: ' + ((performance.now() - startedAt) / 1000).toFixed(2) + ' s';
+        status.textContent = 'Consulta concluída.'; await loadStatus();
+      } catch (error) {
+        status.textContent = 'Erro'; answer.textContent = error.message;
+        duration.textContent = 'Tempo até o erro: ' + ((performance.now() - startedAt) / 1000).toFixed(2) + ' s';
+      }
+      finally { button.disabled = false; }
+    });
+    loadStatus().catch(() => status.textContent = 'Cache ainda não inicializado.');
+
+    // Garante que apenas um tipo de gráfico pode ser marcado (radio-like behavior)
+    const chartCheckboxes = document.querySelectorAll('.chart-selector input[name="tipo_grafico"]');
+    chartCheckboxes.forEach((checkbox) => {
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) {
+          chartCheckboxes.forEach((other) => {
+            if (other !== checkbox) other.checked = false;
+          });
+        }
+      });
+    });
+
+    function showChart(dataUrl) {
+      chart.onerror = () => {
+        chart.hidden = true;
+        chart.style.display = 'none';
+        meta.textContent += '  O navegador não conseguiu carregar o gráfico.';
+      };
+      chart.onload = () => {
+        chart.hidden = false;
+        chart.style.display = 'block';
+      };
+      chart.src = dataUrl;
+    }
+
+    function renderResults(rows) {
+      if (!rows.length) return;
+      const columns = Object.keys(rows[0]);
+      const table = document.createElement('table');
+      const head = table.createTHead().insertRow();
+      columns.forEach((column) => {
+        const cell = document.createElement('th');
+        cell.textContent = column;
+        head.appendChild(cell);
+      });
+      const body = table.createTBody();
+      rows.forEach((row) => {
+        const line = body.insertRow();
+        columns.forEach((column) => {
+          const cell = line.insertCell();
+          cell.textContent = row[column] == null ? '' : String(row[column]);
+        });
+      });
+      results.appendChild(table);
+      results.hidden = false;
+    }
+  </script>
+</body>
+</html>
