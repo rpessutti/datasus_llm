@@ -89,6 +89,20 @@ def ano_expr(col: str) -> str:
     return f'SUBSTR(CAST("{col}" AS VARCHAR), 1, 4)'
 
 
+def ano_int_expr(col: str) -> str:
+    """Expressão SQL (DuckDB) para o ANO (AAAA) como INTEGER a partir de ``col``.
+
+    Diferente de :func:`ano_expr` (que devolve VARCHAR), esta expressão produz
+    um INTEGER — o TIPO canônico de ``atend_ano`` na tabela/view/``resumo_*``.
+    Usar INTEGER permite comparações numéricas nativas (ex.: ``atend_ano = 2024``
+    e ``atend_ano IN (2022, 2023)``) sem casts implícitos.
+
+    ``TRY_CAST`` torna a expressão resiliente a valores não numéricos/ausentes
+    (resulta em NULL em vez de erro).
+    """
+    return f'TRY_CAST(SUBSTR(CAST("{col}" AS VARCHAR), 1, 4) AS INTEGER)'
+
+
 def mes_expr(col: str) -> str:
     """Expressão SQL (DuckDB) para o MÊS ('MM') a partir de ``col``.
 

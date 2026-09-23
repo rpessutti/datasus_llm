@@ -17,6 +17,97 @@ LOGGER = logging.getLogger("datasus_llm")
 
 
 class _CidMixin(_ServiceBase):
+    # >>> CID EXPLÍCITO NA PERGUNTA (precedência absoluta) <<<
+    # Regex estrita para detectar um código CID-10 informado diretamente pelo
+    # usuário na pergunta. Regras:
+    #   - letra A-Z seguida de 2 ou 3 dígitos (ex.: 'A90', 'A150');
+    #   - opcionalmente um separador decimal '.' ou ',' e 1 dígito (ex.: 'A15.0');
+    #   - lookbehind/lookahead impedem casar dentro de tokens maiores (ex.: 'B2B',
+    #     'COVID19', 'ABC123'), evitando falsos positivos.
+    # Decisão (C): os separadores de LISTA aceitos no enunciado são vírgula e
+    # ponto e vírgula; a regex abaixo captura cada código individualmente.
+    _EXPLICIT_CID_RE = re.compile(
+        r"(?<![A-Za-z0-9])([A-Za-z]\d{2,3})(?:[.,](\d))?(?![A-Za-z0-9])"
+    )
+
+    def _extract_explicit_cid(self, question: str) -> list[str]:
+        """Extrai os CID(s)-10 informados EXPLICITAMENTE na pergunta.
+
+        Retorna uma lista de códigos normalizados no formato SUBCAT (sem ponto,
+        MAIÚSCULAS) e SEM duplicatas, preservando a ordem de aparição. Ex.:
+          "casos de A90"                 -> ['A90']
+          "A90, B05 em 2024"             -> ['A90', 'B05']
+          "compare A15.0; A15,1"         -> ['A150', 'A151']
+          "dengue em 2024"               -> []
+
+        Aceita os separadores de lista vírgula e ponto e vírgula (Decisão C).
+        É a base da regra de precedência: quando há CID explícito, a descoberta
+        automática (LLM/de-para) é PULADA.
+        """
+        if not question:
+            return []
+        codigos: list[str] = []
+        vistos: set[str] = set()
+        for match in self._EXPLICIT_CID_RE.finditer(question):
+            base = match.group(1).upper()
+            dec = match.group(2) or ""
+            canon = base + dec  # 'A15.0' -> 'A150' ; 'A90' -> 'A90'
+            if canon in vistos:
+                continue
+            vistos.add(canon)
+            codigos.append(canon)
+        return codigos
+
+    def _is_explicit_cid_question(self, question: str) -> bool:
+        """True se a pergunta informa ao menos um CID-10 explicitamente."""
+        return bool(self._extract_explicit_cid(question))
+
+    def _explicit_cid_grounding_block(self, cid_exp: list[str], request_id: str) -> str:
+        """Bloco do prompt para quando o USUÁRIO informou o(s) CID(s).
+
+        Devolve uma instrução AUTORITATIVA para a LLM usar EXATAMENTE os códigos
+        informados (Decisão A1), sem descobrir/substituir. Cada código é
+        anotado com a descrição oficial (quando disponível) para dar contexto.
+        """
+        linhas: list[str] = []
+        descricoes: dict[str, str | None] = {}
+        try:
+            from db.cid_map import get_cid_map
+            cid_map = get_cid_map()
+            for codigo in cid_exp:
+                try:
+                    descricoes[codigo] = cid_map.descricao_de(codigo)
+                except Exception:
+                    descricoes[codigo] = None
+        except Exception:
+            descricoes = {c: None for c in cid_exp}
+
+        for codigo in cid_exp:
+            desc = descricoes.get(codigo)
+            if desc:
+                desc = desc.strip()
+                if len(desc) > 90:
+                    desc = desc[:87] + "..."
+                linhas.append(f"  - {codigo} = {desc}")
+            else:
+                linhas.append(f"  - {codigo}")
+
+        lista = ", ".join(cid_exp)
+        exemplo = cid_exp[0]
+        LOGGER.info(
+            "cid EXPLÍCITO na pergunta request_id=%s codigos=%s (grounding autoritativo)",
+            request_id, ",".join(cid_exp),
+        )
+        return (
+            "CID(S) FORNECIDO(S) PELO USUÁRIO NA PERGUNTA (USE EXATAMENTE ESTES CÓDIGOS):\n"
+            + "\n".join(linhas)
+            + f"\nA pergunta já especifica o(s) CID(s): {lista}. NÃO descubra, substitua "
+            "ou acrescente outros códigos. Use TODOS e SOMENTE estes na(s) cláusula(s) "
+            f"de filtro, no formato LIKE 'CODIGO%' (MAIÚSCULAS, SEM ponto). "
+            f"Ex.: UPPER(TRIM(CAST(\"ColunaCID\" AS VARCHAR))) LIKE '{exemplo}%'"
+            + (" (ou combine com OR para mais de um CID)." if len(cid_exp) > 1 else ".")
+        )
+
     def _discover_cid_via_llm(self, question: str, request_id: str) -> str:
         """PRIMEIRA RODADA (opção A): a própria LLM consulta a tabela `cid10`.
 
@@ -29,6 +120,16 @@ class _CidMixin(_ServiceBase):
         vazio). Nunca derruba a geração de SQL.
         """
         if not self.client:
+            return ""
+        # >>> PRECEDÊNCIA (FASE 2.1): se a pergunta informa o CID explicitamente,
+        # NÃO há o que "descobrir" — pulamos o round-trip ao LLM (economia de
+        # latência e evita que a descoberta sobreponha o CID do usuário).
+        cid_exp = self._extract_explicit_cid(question)
+        if cid_exp:
+            LOGGER.info(
+                "cid discovery PULADO (CID explícito na pergunta=%s) request_id=%s",
+                cid_exp, request_id,
+            )
             return ""
         # Heurística barata: só vale a pena consultar o cid10 se a pergunta
         # menciona algum termo "de doença" (evita round-trip em perguntas de
@@ -133,6 +234,13 @@ class _CidMixin(_ServiceBase):
 
         Retorna um bloco de texto (possivelmente vazio) para concatenar ao prompt.
         """
+        # >>> PRECEDÊNCIA (FASE 2.2): CID explícito na pergunta tem prioridade
+        # ABSOLUTA. Não usamos o de-para por doença; devolvemos um bloco
+        # autoritativo ordenando o uso EXATO dos códigos informados.
+        cid_exp = self._extract_explicit_cid(question)
+        if cid_exp:
+            return self._explicit_cid_grounding_block(cid_exp, request_id)
+
         try:
             from db.cid_map import get_cid_map
         except Exception as exc:  # pragma: no cover - import defensivo
@@ -194,6 +302,12 @@ class _CidMixin(_ServiceBase):
         sarampo, o de-para devolve {'B05'} e qualquer CID fora dessa família
         (ex.: A67, B20) deve ser rejeitado — mesmo que exista nos dados.
         """
+        # >>> PRECEDÊNCIA (FASE 2.3): se o usuário informou o CID, a "família
+        # correta" passa a ser EXATAMENTE o conjunto de CIDs informados (regra
+        # A1). Assim a validação não sobrescreve nem amplia o que foi pedido.
+        cid_exp = self._extract_explicit_cid(question)
+        if cid_exp:
+            return set(cid_exp)
         try:
             from db.cid_map import get_cid_map
             cid_map = get_cid_map()
@@ -230,6 +344,16 @@ class _CidMixin(_ServiceBase):
         Retorna a SQL corrigida, ou ``None`` se não houver de-para aplicável
         (nesse caso o chamador recorre ao LLM, agora com o prompt reformulado).
         """
+        # >>> PRECEDÊNCIA (FASE 3.2): quando o usuário informou o CID, NUNCA
+        # reescrevemos de forma determinística — poderíamos colapsar a lista
+        # informada em um único código (Decisão D). Retornamos None e deixamos o
+        # chamador decidir (que, nesse cenário, também preserva o CID do usuário).
+        if self._is_explicit_cid_question(question):
+            LOGGER.info(
+                "correção determinística de CID PULADA (CID explícito na pergunta) request_id=%s",
+                request_id,
+            )
+            return None
         dep = self._cid_map_prefixes_para(question)
         if not dep:
             return None
@@ -334,6 +458,28 @@ class _CidMixin(_ServiceBase):
             setattr(self, cache_attr, cache)
         if request_id in cache:
             return cache[request_id]
+
+        # >>> PARTE 6 (#7): LEITURA DA TABELA PRE-COMPUTADA cid_prefixes <<<
+        # Antes, este metodo fazia DESCRIBE + SELECT DISTINCT SUBSTR por coluna
+        # de diagnostico de CADA grupo A CADA REQUISICAO. Agora os prefixos sao
+        # pre-computados na ingestao (tabela cid_prefixes) e aqui apenas LIDOS.
+        # Fallback: se a tabela estiver vazia/ausente, seguimos com o scan atual
+        # (compatibilidade e testes).
+        try:
+            pre = self.cache.get_cid_prefixes()
+        except Exception:
+            pre = []
+        if pre:
+            prefixos = {p.upper() for p in pre if len(p) >= 2 and p[0].isalpha()}
+            for canon in self._cid_map_prefixes():
+                prefixos.add(canon)
+            todos = sorted(prefixos)
+            cache[request_id] = todos
+            LOGGER.info(
+                "cid grounding request_id=%s prefixos_conhecidos=%d (cid_prefixes pre-computado)",
+                request_id, len(todos),
+            )
+            return todos
 
         prefixos: set[str] = set()
 
@@ -440,6 +586,23 @@ class _CidMixin(_ServiceBase):
             usados.add(_cod)
         if not usados:
             return []
+
+        # >>> PRECEDÊNCIA A1 (FASE 3.1): se o usuário informou CID(s)
+        # explicitamente, o SQL deve usar EXATAMENTE esses códigos — nem a mais,
+        # nem a menos. Comparamos por igualdade de conjuntos (normalizados).
+        if question:
+            explicitos = set(self._extract_explicit_cid(question))
+            if explicitos:
+                faltando = explicitos - usados   # LLM omitiu algum informado
+                a_mais = usados - explicitos      # LLM inventou/adicionou outro
+                divergentes = sorted(faltando | a_mais)
+                if divergentes:
+                    LOGGER.warning(
+                        "CID(s) divergentes do informado pelo usuário (A1). "
+                        "esperado=%s usados=%s divergentes=%s request_id=%s",
+                        sorted(explicitos), sorted(usados), divergentes, request_id,
+                    )
+                return divergentes
 
         # >>> SOLUÇÃO C: validação SEMÂNTICA por família do de-para. <<<
         # Se a pergunta é sobre sarampo, o de-para devolve {'B05'}; qualquer CID

@@ -216,6 +216,95 @@ class _SqlFixMixin(_ServiceBase):
             )
         return sql
 
+    @staticmethod
+    def _fix_atend_ano_casts(sql: str, request_id: str) -> str:
+        """>>> CORREÇÃO I: cast de atend_ano (VARCHAR->INTEGER) na comparação <<<
+
+        >>> FASE 3B: ``atend_ano`` agora é INTEGER em TODOS os caminhos <<<
+        (tabela física, view S1 e fallback legado em ``db/cache.py``). Portanto,
+        em operação normal esta função é um NO-OP SEMÂNTICO: envolver uma coluna
+        já INTEGER em ``CAST(... AS INTEGER)`` não altera o resultado.
+
+        Ela é MANTIDA por robustez/idempotência: protege contra ambientes com
+        cache intermediário ainda em VARCHAR (ex.: caches migrados pela PARTE 3
+        antes da conversão VARCHAR->INTEGER) ou contra qualquer caminho futuro
+        que volte a expor ``atend_ano`` como VARCHAR. Quando o LLM compara
+        ``atend_ano`` com literais INTEIROS, o DuckDB abortava com:
+
+          Binder Error: Cannot mix values of type VARCHAR and INTEGER_LITERAL
+          in BETWEEN clause - an explicit cast is required
+          (ou: Cannot compare values of type VARCHAR and type BIGINT)
+
+        Correção determinística e IDEMPOTENTE: envolve ``atend_ano`` em
+        ``CAST(atend_ano AS INTEGER)`` nas cláusulas em que ele é comparado com
+        valores NUMÉRICOS (``=``, ``<>``, ``!=``, ``<``, ``<=``, ``>``, ``>=``,
+        ``BETWEEN ... AND ...``, ``IN (numéricos)``). Comparações com STRINGS
+        (ex.: ``atend_ano IN ('2024','2025')``) NÃO são alteradas.
+
+        É chamada APÓS ``_strip_foreign_year_filters``, que reescreve os
+        filtros de ano do LLM para o formato ``atend_ano IN (<anos>)`` com
+        literais inteiros — que também precisa do cast.
+        """
+        if not sql:
+            return sql
+        if not re.search(r"\batend_ano\b", sql, flags=re.IGNORECASE):
+            return sql
+
+        original = sql
+        # Já castado? -> não faz nada (idempotência).
+        cast_prefix = "CAST(atend_ano AS INTEGER)"
+
+        def _ja_castado(start: int) -> bool:
+            prefixo = sql[:start].rstrip().upper()
+            return prefixo.endswith("CAST(ATEND_ANO AS INTEGER")
+
+        # 1) BETWEEN <num> AND <num>  ->  conjunto numérico sem string.
+        between_re = re.compile(
+            r"\batend_ano\b(\s*)(BETWEEN\s+|NOT\s+BETWEEN\s+)"
+            r"(-?\d+(?:\.\d+)?)\s+AND\s+(-?\d+(?:\.\d+)?)",
+            flags=re.IGNORECASE,
+        )
+        sql = between_re.sub(
+            lambda m: f"{cast_prefix}{m.group(1)}{m.group(2)}{m.group(3)} AND {m.group(4)}",
+            sql,
+        )
+
+        # 2) Comparadores simples com número: = <> != < <= > >=.
+        compar_re = re.compile(
+            r"\batend_ano\b(\s*(?:=|<>|!=|<=|>=|<|>)\s*)(-?\d+(?:\.\d+)?)\b",
+            flags=re.IGNORECASE,
+        )
+        sql = compar_re.sub(
+            lambda m: f"{cast_prefix}{m.group(1)}{m.group(2)}",
+            sql,
+        )
+
+        # 3) IN (<lista>) com >=1 literal NUMÉRICO (ex.: IN (2024, 2025)).
+        in_re = re.compile(
+            r"\batend_ano\b(\s+(?:NOT\s+)?IN\s*\()([^)]*)\)",
+            flags=re.IGNORECASE,
+        )
+
+        def _sub_in(m: re.Match) -> str:
+            conteudo = m.group(2)
+            # Só trata listas 100% numéricas (sem strings) para não quebrar
+            # comparações legítimas com VARCHAR ('2024').
+            tokens = [t.strip() for t in conteudo.split(",") if t.strip()]
+            if not tokens or any("'" in t or '"' in t for t in tokens):
+                return m.group(0)
+            if not all(re.fullmatch(r"-?\d+(?:\.\d+)?", t) for t in tokens):
+                return m.group(0)
+            return f"{cast_prefix}{m.group(1)}{conteudo})"
+
+        sql = in_re.sub(_sub_in, sql)
+
+        if sql != original:
+            LOGGER.warning(
+                "cast aplicado em atend_ano (VARCHAR->INTEGER) para comparação numérica request_id=%s",
+                request_id,
+            )
+        return sql
+
     # Colunas "cruas" de ano presentes nos grupos DATASUS. Como a view
     # ``datasus_query_cache`` as expõe como VARCHAR (o UNION ALL preserva o tipo
     # original do parquet), qualquer comparação/ordenação com inteiro quebra:

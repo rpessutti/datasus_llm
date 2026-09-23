@@ -11,6 +11,9 @@ Cobre:
 3. Detecção de relação (tabela OU view) via _cache_relation_exists.
 4. Integração com prepare_question_cache (grupo-view aparece na query unificada).
 5. _verify_period_integrity não tenta UPDATE em view.
+6. PARTE 4 (#4): a view S1 expõe atend_ano/atend_mes do CAMPO NATIVO
+   (mesmos tipos da tabela física: atend_ano INTEGER, atend_mes VARCHAR) e o
+   recorte temporal tem PARIDADE com a tabela física.
 """
 
 import os
@@ -100,6 +103,25 @@ class GroupCacheS1Test(unittest.TestCase):
                 "SELECT parquet_year, parquet_month FROM datasus_cache ORDER BY parquet_year, parquet_month"
             ).fetchall()
             self.assertEqual(rows, [(2022, "05"), (2022, "06")])
+
+            # PARTE 4 (#4): a view S1 TAMBÉM expõe atend_ano/atend_mes do CAMPO
+            # NATIVO (DT_INTER), com os mesmos tipos da tabela física (FASE 3B):
+            # atend_ano INTEGER, atend_mes VARCHAR. parquet_year/parquet_month
+            # continuam presentes por compatibilidade.
+            types = {
+                r[0].lower(): str(r[1]).upper()
+                for r in g.connection.execute("DESCRIBE datasus_cache").fetchall()
+            }
+            self.assertIn("atend_ano", types)
+            self.assertIn("atend_mes", types)
+            self.assertIn("INT", types["atend_ano"])
+            self.assertIn("VARCHAR", types["atend_mes"])
+            self.assertIn("parquet_year", types)
+
+            atend = g.connection.execute(
+                "SELECT atend_ano, atend_mes FROM datasus_cache ORDER BY atend_ano, atend_mes"
+            ).fetchall()
+            self.assertEqual(atend, [(2022, "05"), (2022, "06")])
         finally:
             g.close()
 
@@ -131,6 +153,38 @@ class GroupCacheS1Test(unittest.TestCase):
             g.ingest()
             # Não deve levantar exceção (o backfill UPDATE é pulado em view).
             g.finalize()
+        finally:
+            g.close()
+
+    def test_view_s1_expoe_atend_nativo_e_paridade_recorte(self) -> None:
+        """PARTE 4 (#4): a view S1 deriva atend_ano/atend_mes do CAMPO NATIVO.
+
+        Paridade S1↔TABELA: o recorte temporal por atend_ano/atend_mes deve
+        devolver EXATAMENTE as mesmas linhas que a tabela física (FASE 3)
+        devolveria para os mesmos dados — i.e., os valores coincidem com os
+        derivados de DT_INTER (20220510 -> 2022/05; 20220615 -> 2022/06).
+        """
+        g = self._group()
+        try:
+            g.ingest()
+            # atend_ano/atend_mes derivados do campo nativo (não do nome do arquivo).
+            self.assertEqual(
+                g.connection.execute(
+                    "SELECT atend_ano, atend_mes FROM datasus_cache "
+                    "WHERE atend_ano = 2022 AND atend_mes = '05'"
+                ).fetchone(),
+                (2022, "05"),
+            )
+            # Recorte por período nativo conta as linhas certas.
+            n_maio = g.connection.execute(
+                "SELECT COUNT(*) FROM datasus_cache WHERE atend_ano = 2022 AND atend_mes = '05'"
+            ).fetchone()[0]
+            self.assertEqual(n_maio, 1)
+            # Um mês sem dados não retorna nada (o filtro é pelo campo nativo).
+            n_vazio = g.connection.execute(
+                "SELECT COUNT(*) FROM datasus_cache WHERE atend_ano = 2022 AND atend_mes = '07'"
+            ).fetchone()[0]
+            self.assertEqual(n_vazio, 0)
         finally:
             g.close()
 
@@ -184,6 +238,34 @@ class DatasusCacheS1Test(unittest.TestCase):
             self.assertIn("er", groups)
             self.assertEqual(groups["er"]["rows"], 2)
             self.assertTrue(groups["er"]["cache_table"])
+        finally:
+            c.close()
+
+    def test_prepare_question_cache_s1_usa_campo_nativo(self) -> None:
+        """PARTE 4 (#4): em S1 o recorte usa atend_ano/atend_mes do campo nativo.
+
+        A view unificada `datasus_query_cache` NÃO deve derivar período de
+        parquet_year/parquet_month; o WHERE usa atend_ano/atend_mes (nativos).
+        """
+        c = self._cache()
+        try:
+            c._discover_groups()
+            for group in c.groups.values():
+                group.reopen()
+                self.assertEqual(group.ingest()["status"], "view_ok")
+
+            sql = "SELECT COUNT(*) AS n FROM datasus_query_cache"
+            c.prepare_question_cache("casos de dengue em maio de 2022", "req_s1_nat", sql=sql)
+
+            view_sql = c.connection.execute(
+                "SELECT sql FROM duckdb_views() WHERE view_name = 'datasus_query_cache'"
+            ).fetchone()[0]
+            # O recorte usa as colunas nativas (não parquet_year/parquet_month).
+            self.assertIn("atend_ano", view_sql)
+            self.assertIn("atend_mes", view_sql)
+            # Mês solicitado (maio) restringe; junho fica de fora.
+            rows = c.connection.execute(sql).fetchall()
+            self.assertEqual(rows, [(1,)])
         finally:
             c.close()
 

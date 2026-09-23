@@ -289,16 +289,28 @@ class _GenerateMixin(_ServiceBase):
         #    tabela `cid10` no DuckDB (opção A: 1ª rodada), em vez de o Python
         #    injetar o de-para pronto. O bloco abaixo traz o resultado dessa
         #    consulta auto-iniciada pela LLM (pode ser vazio).
-        cid_discovery = self._discover_cid_via_llm(question, request_id)
-
-        # >>> FALLBACK DETERMINÍSTICO (reativa _resolve_cid_grounding): se a
-        # descoberta via LLM falhou/não achou nada (ex.: timeout, tabela cid10
-        # indisponível, doença fora dos aliases), usamos o de-para OFICIAL
-        # (CID_10.CSV/CidMap) como fonte. Assim mantemos o grounding SEMÂNTICO
-        # sem depender do round-trip ao LLM — e sem duplicar blocos quando a
-        # descoberta já trouxe resultados.
-        if not cid_discovery:
+        # >>> PRECEDÊNCIA (FASE 4.1): CID explícito na pergunta tem prioridade
+        # ABSOLUTA. Nesse caso PULAMOS tanto a descoberta via LLM quanto o
+        # de-para por doença: o bloco autoritativo (com os códigos informados)
+        # vem de _resolve_cid_grounding, que detecta o CID explícito.
+        cid_expl = self._extract_explicit_cid(question)
+        if cid_expl:
+            LOGGER.info(
+                "CID explícito na pergunta=%s; pulando descoberta/de-para de doença. request_id=%s",
+                cid_expl, request_id,
+            )
             cid_discovery = self._resolve_cid_grounding(question, request_id)
+        else:
+            cid_discovery = self._discover_cid_via_llm(question, request_id)
+
+            # >>> FALLBACK DETERMINÍSTICO (reativa _resolve_cid_grounding): se a
+            # descoberta via LLM falhou/não achou nada (ex.: timeout, tabela cid10
+            # indisponível, doença fora dos aliases), usamos o de-para OFICIAL
+            # (CID_10.CSV/CidMap) como fonte. Assim mantemos o grounding SEMÂNTICO
+            # sem depender do round-trip ao LLM — e sem duplicar blocos quando a
+            # descoberta já trouxe resultados.
+            if not cid_discovery:
+                cid_discovery = self._resolve_cid_grounding(question, request_id)
 
         # 2) Lista dos prefixos REAIS presentes nos dados (validação de escopo).
         known_cids = self._known_cid_prefixes(request_id)
@@ -382,6 +394,15 @@ class _GenerateMixin(_ServiceBase):
             "### REGRAS DE SAÍDA (OBRIGATÓRIAS)\n"
             "- Retorne SOMENTE a consulta SQL. SEM markdown, SEM crases, SEM comentários, SEM explicações.\n"
             "- Comece com SELECT ou WITH. Termine a query com LIMIT.\n"
+            # >>> PARTE 7 (#10): LIMIT sem ORDER BY e NAO-DETERMINISTICO <<<
+            # Como o DuckDB roda com preserve_insertion_order=false, escolher
+            # 'as N primeiras linhas' sem ORDER BY varia entre execucoes. Para
+            # respostas reproduziveis, TODO LIMIT precisa de ORDER BY explicito.
+            "- Se a query usar LIMIT, ela OBRIGATORIAMENTE deve ter um ORDER BY "
+            "explicito antes do LIMIT (ex.: ORDER BY casos DESC, cid ASC). Sem "
+            "ORDER BY, o resultado do LIMIT e NAO-deterministico e muda entre "
+            "execucoes. Ao ordenar por uma agregacao, ordene pela coluna de saida "
+            "(ou pelo indice/alias), ex.: 'ORDER BY COUNT(*) DESC' ou 'ORDER BY 2 DESC'.\n"
             "- Use UMA única instrução. Nunca use INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/COPY/ATTACH.\n"
             "- A query deve estar COMPLETA (parênteses e aspas fechados).\n\n"
             "### REGRAS DE COLUNAS (CRÍTICAS)\n"
@@ -526,7 +547,62 @@ class _GenerateMixin(_ServiceBase):
         # (ex.: 'A90' de dengue, 'C44' de câncer de pele) que não existem no
         # cache são enviados de volta ao LLM para correção.
         cids_invalidos = self._validate_cid_filters(sql, request_id, question=question)
-        if cids_invalidos:
+        if cids_invalidos and self._is_explicit_cid_question(question):
+            # >>> PRECEDÊNCIA (FASE 4.2, Decisões A1/D): o usuário informou o CID
+            # explicitamente. Preservamos SEMPRE o CID do usuário: não reescrevemos,
+            # não trocamos pelo de-para e NUNCA forçamos 'WHERE 1=0'. Apenas
+            # registramos a divergência no log (ex.: LLM adicionou/omitiu código).
+            self._first_attempt_ok = False
+            explicitos = self._extract_explicit_cid(question)
+            LOGGER.warning(
+                "CID(s) divergentes do informado pelo usuário %s: %s. "
+                "PRESERVANDO o CID do usuário (não reescreve). request_id=%s",
+                explicitos,
+                cids_invalidos,
+                request_id,
+            )
+            # Best-effort ÚNICO: pede ao LLM para alinhar a query aos CIDs
+            # informados (A1). NÃO usa de-para, NÃO reescreve determinísticamente
+            # e, em caso de falha, PRESERVA a SQL com o CID do usuário (Decisão D).
+            try:
+                sql_ajustada = self._request_sql_fix(
+                    question=question,
+                    sql_atual=sql,
+                    request_id=request_id,
+                    periods=periods,
+                    limite=limite,
+                    real_columns=real_columns,
+                    problemas=[
+                        f"O usuário informou explicitamente o(s) CID(s) {explicitos}; "
+                        "o SQL deve usar EXATAMENTE e SOMENTE esses códigos."
+                    ],
+                    cids_corretos=explicitos,
+                )
+                # Só aceita o ajuste se ele respeitar a regra A1; caso contrário,
+                # mantém a SQL anterior (preserva o CID do usuário).
+                candidata = self._normalize_relations(sql_ajustada)
+                candidata = self._fix_unterminated_strings(candidata)
+                candidata = self._fix_incomplete_sql(
+                    candidata, question, request_id, periods, limite
+                )
+                if not self._validate_cid_filters(
+                    candidata, request_id, question=question
+                ):
+                    sql = candidata
+                else:
+                    LOGGER.warning(
+                        "ajuste do LLM ainda diverge do CID do usuário; "
+                        "mantendo SQL original (CID preservado). request_id=%s",
+                        request_id,
+                    )
+            except Exception as fix_err:
+                LOGGER.warning(
+                    "tentativa de alinhar CID ao informado falhou (%s); "
+                    "preservando SQL com o CID do usuário. request_id=%s",
+                    type(fix_err).__name__,
+                    request_id,
+                )
+        elif cids_invalidos:
             # >>> SOLUÇÃO D: uma correção de CID invalida a 'primeira tentativa'. <<<
             self._first_attempt_ok = False
             LOGGER.warning(
@@ -599,6 +675,15 @@ class _GenerateMixin(_ServiceBase):
         sql = self._strip_foreign_year_filters(sql, periods, request_id)
         # >>> CORREÇÃO G: cast de colunas CRUAS de ano (VARCHAR->INTEGER). <<<
         sql = self._fix_raw_year_casts(sql, request_id)
+        # >>> CORREÇÃO I: cast de atend_ano (VARCHAR->INTEGER) em comparações
+        # numéricas (BETWEEN, =, IN com inteiros...). A view expõe atend_ano
+        # como VARCHAR; comparar com literal inteiro gera
+        # "Cannot mix values of type VARCHAR and INTEGER_LITERAL in BETWEEN". <<<
+        # FASE 3B: atend_ano agora é INTEGER em todos os caminhos (tabela/view
+        # S1/fallback legado). Este cast é, em operação normal, um no-op
+        # semântico (INTEGER->INTEGER); mantido por robustez contra caches
+        # intermediários ainda em VARCHAR. <<<
+        sql = self._fix_atend_ano_casts(sql, request_id)
         # >>> CORREÇÃO DATA: remove funções de data do sistema (CURRENT_DATE,
         # NOW, EXTRACT(YEAR FROM CURRENT_DATE)...) trocando-as pelo ano atual
         # do sistema como LITERAL, pois a base não tem coluna de data. <<<

@@ -122,6 +122,31 @@ class DatasusCacheS3Test(unittest.TestCase):
         finally:
             c.close()
 
+    def test_grupo_sem_periodo_e_excluido_do_union(self) -> None:
+        """PARTE 1 (#5): grupo SEM campo de período mapeado NÃO entra no UNION.
+
+        Antes, um grupo sem PERIOD_FIELDS entrava com atend_ano/atend_mes NULL
+        e WHERE TRUE — contamina o recorte (linhas aparecem em qualquer período).
+        Agora ele deve ser EXCLUÍDO do UNION: se todos os grupos do exemplo
+        forem filtrados, prepare_question_cache deve cair no erro já existente
+        ("Nenhum período do cache corresponde...").
+        """
+        # Simula um grupo cujo nome NÃO consta em PERIOD_FIELDS.
+        from db import cache as cache_mod
+        original = dict(cache_mod.PERIOD_FIELDS)
+        c = self._cache()
+        try:
+            # Remove o mapeamento de período do grupo 'er' que acabou de ser ingerido.
+            for name in list(c.groups.keys()):
+                cache_mod.PERIOD_FIELDS.pop(name, None)
+            with self.assertRaises(RuntimeError) as ctx:
+                c.prepare_question_cache("casos de dengue em 2022", "req_no_period")
+            self.assertIn("Nenhum período", str(ctx.exception))
+        finally:
+            cache_mod.PERIOD_FIELDS.clear()
+            cache_mod.PERIOD_FIELDS.update(original)
+            c.close()
+
     def test_paridade_com_modo_tabela(self) -> None:
         sql = "SELECT CID, COUNT(*) AS casos FROM datasus_query_cache GROUP BY CID ORDER BY CID"
         # Modo S3 (view)

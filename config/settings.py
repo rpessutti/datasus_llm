@@ -109,8 +109,8 @@ class Settings:
     # ESPECÍFICO para geração de SQL, parametrizável e limitado por llm_timeout.
     llm_sql_timeout = float(os.getenv("LLM_SQL_TIMEOUT", str(llm_timeout)))
     # Correções/refazer/round-trips usam tetos menores (prompts menores).
-    llm_fix_timeout = float(os.getenv("LLM_FIX_TIMEOUT", "60"))
-    llm_answer_timeout = float(os.getenv("LLM_ANSWER_TIMEOUT", "60"))
+    llm_fix_timeout = float(os.getenv("LLM_FIX_TIMEOUT", "90"))
+    llm_answer_timeout = float(os.getenv("LLM_ANSWER_TIMEOUT", "90"))
 
     # Parâmetros de geração SQL
     llm_sql_temperature = float(os.getenv("LLM_SQL_TEMPERATURE", "0.1"))

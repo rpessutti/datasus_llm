@@ -13,8 +13,33 @@ from config.settings import PROJECT_DIR
 from core.io_utils import _discover_files_in, _retry_copyfile, _retry_stat
 from core.logging_config import log_calls
 from core.path_utils import _grouped_cache_path, _schema_rows, _file_period, _extract_period_from_path
+from db.period_fields import (
+    PERIOD_FIELDS,
+    ATEND_ANO,
+    ATEND_MES,
+    ano_expr,
+    ano_int_expr,
+    mes_expr,
+)
 
 LOGGER = logging.getLogger("datasus_llm")
+
+# ============================================================================
+# MODO GRUPOS E VIEW UNIFICADA (UNION) - decisoes #3/#4/#5 (documentacao PARTE 8)
+# ----------------------------------------------------------------------------
+# Cada grupo do DATASUS (er, si, ps, sp, ...) vive em seu proprio banco anexado
+# (<grupo>.datasus_cache). A pergunta e respondida sobre a view unificada
+# `datasus_query_cache`, um UNION ALL dos grupos selecionados.
+#
+# #3 - Colunas de periodo MATERIALIZADAS na ingestao: atend_ano/atend_mes entram
+#      como colunas FISICAS de cada grupo (derivadas do campo NATIVO de periodo),
+#      evitando parsing/derivacao em tempo de consulta.
+# #4 - View unificada ALINHADA ao campo NATIVO de periodo de cada grupo: o UNION
+#      usa o campo de periodo real do grupo (nao um derivado por nome de arquivo),
+#      para que o recorte temporal corresponda ao atendimento.
+# #5 - Grupos SEM campo de periodo sao EXCLUIDOS do UNION: evita colunas de
+#      periodo nulas/ambiguas no UNION ALL.
+# ============================================================================
 
 
 class _GroupCache:
@@ -106,6 +131,14 @@ class _GroupCache:
             if "invalid" not in manifest_cols:
                 LOGGER.info("grupo %s: migrando file_manifest para incluir coluna 'invalid'", self.name)
                 self.connection.execute(f"ALTER TABLE {manifest_table} ADD COLUMN invalid INTEGER DEFAULT 0")
+            # >>> FASE 3 (#3): MIGRACAO IDEMPOTENTE das colunas de periodo FISICAS <<<
+            # Materializa atend_ano/atend_mes na tabela datasus_cache (quando ela
+            # for TABELA fisica), derivadas do CAMPO NATIVO de periodo do grupo
+            # (SP_DTINTER, DT_INTER, DT_ATEND, PA_CMP, AP_DTINIC — ver
+            # db/period_fields.py). Isso permite que o UNION de prepare_question_cache
+            # use as colunas fisicas (push-down) em vez de SUBSTR(CAST(...)) a cada
+            # consulta. Idempotente: so adiciona colunas que faltam; nunca apaga dados.
+            self._migrate_period_columns()
             self.connection.execute(f"CREATE TABLE IF NOT EXISTS {metadata_table} (key VARCHAR PRIMARY KEY, value BIGINT)")
             self.connection.execute(
                 f"CREATE TABLE IF NOT EXISTS {period_table} "
@@ -201,6 +234,181 @@ class _GroupCache:
             )
             raise
 
+    def _period_col_projection(self, col: str) -> str | None:
+        """FASE 3 (#3.3): expressao de projecao de uma coluna de periodo fisica.
+
+        Quando ``col`` for ``atend_ano`` ou ``atend_mes`` e o grupo tiver campo
+        nativo de periodo, retorna a expressao SQL que deriva o valor do CAMPO
+        NATIVO (ex.: ``SUBSTR(CAST("DT_INTER" AS VARCHAR), 1, 4) AS atend_ano``).
+        Caso contrario retorna ``None`` (o chamador usa o caminho padrao).
+
+        Isso garante que os LOTES INCREMENTAIS gravem atend_ano/atend_mes
+        preenchidos (nunca CAST(NULL)) — o mesmo bug que ocorria com
+        parquet_year/parquet_month em lotes incrementais.
+        """
+        pf = PERIOD_FIELDS.get(self.name)
+        if pf is None:
+            return None
+        pcol = pf.columns[0]
+        if col == ATEND_ANO:
+            # FASE 3B: atend_ano e INTEGER (caminho canonico). TRY_CAST garante
+            # NULL em vez de erro para valores ausentes/nao numericos.
+            return f"{ano_int_expr(pcol)} AS {ATEND_ANO}"
+        if col == ATEND_MES:
+            return f"{mes_expr(pcol)} AS {ATEND_MES}"
+        return None
+
+    def _period_projection_exprs(self) -> str:
+        """FASE 3 (#3.2): expressoes SQL de atend_ano/atend_mes para o SELECT inicial.
+
+        Retorna um fragmento SQL (precedido de virgula) que deriva as colunas
+        FISICAS atend_ano/atend_mes do CAMPO NATIVO de periodo do grupo. Retorna
+        string vazia quando o grupo nao tem campo mapeado (a tabela sera criada
+        sem essas colunas, e a migracao/backfill nao se aplica).
+
+        Usado na criacao inicial de datasus_cache (``CREATE OR REPLACE TABLE``).
+        """
+        pf = PERIOD_FIELDS.get(self.name)
+        if pf is None:
+            return ""
+        pcol = pf.columns[0]
+        # FASE 3B: atend_ano e INTEGER (caminho canonico); atend_mes continua
+        # VARCHAR ('01'..'12'). Mantem paridade com a view S1 e os resumos.
+        ano_sql = ano_int_expr(pcol)
+        mes_sql = mes_expr(pcol)
+        return f", {ano_sql} AS {ATEND_ANO}, {mes_sql} AS {ATEND_MES}"
+
+    def _ensure_period_columns_in_table(self, cache_table: str) -> None:
+        """FASE 3 (#3.2/#3.3): garante atend_ano/atend_mes na TABELA datasus_cache.
+
+        Se a tabela existir sem as colunas, adiciona-as (ALTER TABLE) e faz o
+        backfill. Se ja existirem, nao faz nada. Idempotente.
+        """
+        pf = PERIOD_FIELDS.get(self.name)
+        if pf is None:
+            return
+        try:
+            if not self._cache_table_exists():
+                return
+            # FASE 3B: guardamos o TIPO de cada coluna para detectar e
+            # converter uma coluna atend_ano legada em VARCHAR -> INTEGER.
+            desc = {
+                row[0].lower(): str(row[1]).upper()
+                for row in self.connection.execute(f"DESCRIBE {cache_table}").fetchall()
+            }
+            cols = set(desc)
+            if ATEND_ANO in cols and ATEND_MES in cols:
+                return
+            self._migrate_period_columns()
+        except Exception:
+            LOGGER.exception(
+                "grupo %s: falha ao garantir colunas de periodo em %s", self.name, cache_table,
+            )
+
+    def _migrate_period_columns(self) -> None:
+        """FASE 3 (#3): adiciona atend_ano/atend_mes FISICOS a datasus_cache (TABELA).
+
+        Materializa as colunas derivadas de periodo na tabela fisica do grupo,
+        usando o CAMPO NATIVO de periodo (ver db/period_fields.py). Idempotente:
+        so adiciona colunas que ainda faltam. Nao faz nada quando:
+
+          * o grupo nao tem campo nativo de periodo mapeado; ou
+          * datasus_cache e uma VIEW (modo S1); ou
+          * datasus_cache (TABELA) ainda nao existe (sera criada com as colunas
+            pelo primeiro lote em import_batch/ingest).
+
+        Depois de adicionar a coluna, dispara um BACKFILL idempotente (3.4) para
+        preencher as linhas ja existentes a partir do campo nativo.
+        """
+        pf = PERIOD_FIELDS.get(self.name)
+        if pf is None:
+            return
+        try:
+            # So se aplica a TABELA fisica (nao a VIEW do modo S1).
+            if not self._cache_table_exists():
+                return
+            cache_table = f"datasus_cache" if not self._using_main_connection else f"{self.name}.datasus_cache"
+            # FASE 3B: guardamos o TIPO de cada coluna para detectar e
+            # converter uma coluna atend_ano legada em VARCHAR -> INTEGER.
+            desc = {
+                row[0].lower(): str(row[1]).upper()
+                for row in self.connection.execute(f"DESCRIBE {cache_table}").fetchall()
+            }
+            cols = set(desc)
+            added = False
+            # FASE 3B: atend_ano e INTEGER (tipo canonico).
+            if ATEND_ANO not in cols:
+                LOGGER.info("grupo %s: migrando %s -> +%s INTEGER", self.name, cache_table, ATEND_ANO)
+                self.connection.execute(f"ALTER TABLE {cache_table} ADD COLUMN {ATEND_ANO} INTEGER")
+                added = True
+            elif "INT" not in desc.get(ATEND_ANO, ""):
+                # Coluna existente com tipo INCOMPATIVEL (ex.: VARCHAR migrado na
+                # PARTE 3). Converte para INTEGER sem apagar dados (TRY_CAST ->
+                # NULL em valores nao numericos). Idempotente: so quando o tipo
+                # nao for INTEGER.
+                LOGGER.info(
+                    "grupo %s: migrando %s.%s tipo %s -> INTEGER",
+                    self.name, cache_table, ATEND_ANO, desc.get(ATEND_ANO),
+                )
+                self.connection.execute(
+                    f"ALTER TABLE {cache_table} ALTER COLUMN {ATEND_ANO} "
+                    f"TYPE INTEGER USING TRY_CAST({ATEND_ANO} AS INTEGER)"
+                )
+            if ATEND_MES not in cols:
+                LOGGER.info("grupo %s: migrando %s -> +%s VARCHAR", self.name, cache_table, ATEND_MES)
+                self.connection.execute(f"ALTER TABLE {cache_table} ADD COLUMN {ATEND_MES} VARCHAR")
+                added = True
+            if added:
+                # Preenche as linhas ja existentes a partir do campo nativo.
+                self._backfill_period_columns()
+        except Exception:
+            LOGGER.exception(
+                "grupo %s: falha ao migrar colunas de periodo fisicas (%s/%s)",
+                self.name, ATEND_ANO, ATEND_MES,
+            )
+
+    def _backfill_period_columns(self) -> None:
+        """FASE 3 (#3.4): preenche atend_ano/atend_mes nulos a partir do campo nativo.
+
+        Idempotente: so toca linhas com atend_ano NULL. Usa o CAMPO NATIVO de
+        periodo do grupo (SP_DTINTER, DT_INTER, DT_ATEND, PA_CMP, AP_DTINIC).
+        Nao faz nada em modo VIEW (S1) nem quando o grupo nao tem campo mapeado.
+        """
+        pf = PERIOD_FIELDS.get(self.name)
+        if pf is None:
+            return
+        try:
+            if not self._cache_table_exists():
+                return
+            cache_table = f"datasus_cache" if not self._using_main_connection else f"{self.name}.datasus_cache"
+            cols = {
+                row[0].lower()
+                for row in self.connection.execute(f"DESCRIBE {cache_table}").fetchall()
+            }
+            if ATEND_ANO not in cols or ATEND_MES not in cols:
+                return
+            pcol = pf.columns[0]
+            if pcol.lower() not in cols:
+                # Campo nativo ausente neste grupo (ex.: cache antigo): nada a fazer.
+                LOGGER.warning(
+                    "grupo %s: campo nativo de periodo %s ausente em %s; "
+                    "backfill de %s/%s ignorado",
+                    self.name, pcol, cache_table, ATEND_ANO, ATEND_MES,
+                )
+                return
+            ano_sql = ano_int_expr(pcol)
+            mes_sql = mes_expr(pcol)
+            self.connection.execute(
+                f"UPDATE {cache_table} SET "
+                f"{ATEND_ANO} = {ano_sql}, "
+                f"{ATEND_MES} = {mes_sql} "
+                f"WHERE {ATEND_ANO} IS NULL AND \"{pcol}\" IS NOT NULL"
+            )
+        except Exception:
+            LOGGER.exception(
+                "grupo %s: falha no backfill de %s/%s", self.name, ATEND_ANO, ATEND_MES,
+            )
+
     def _configure_memory(self) -> None:
         # Configuração centralizada em config/settings.py (sugestão 5)
         # Usa os MESMOS defaults de Settings para manter consistência entre o
@@ -252,14 +460,49 @@ class _GroupCache:
             return default
 
     def _qualify_sql(self, sql: str) -> str:
-        """Qualifica tabelas comuns com o schema do grupo quando usando a conexão principal."""
-        for table in ("file_manifest", "metadata", "period_index", "group_checkpoint", "datasus_cache", "datasus"):
-            sql = re.sub(
-                rf"\b(?<!['\"`])({table})\b(?!['\"`])",
-                f"{self.name}.{table}",
-                sql,
-            )
-        return sql
+        """>>> PARTE 5 (#1): qualificacao ANCORADA em FROM/JOIN <<<
+
+        A versao anterior reescrevia QUALQUER token datasus_cache/datasus
+        (etc.) no SQL INTEIRO via regex com lookbehind/lookahead de aspas.
+        Isso era ARRISCADO: tokens cercados por outros caracteres (ex.: dentro
+        de um literal LIKE '%datasus%') NAO estavam adjacentes a aspas e eram
+        reescritos, CORROMPENDO o literal ('%datasus%' -> '%pa.datasus%').
+
+        Agora so qualificamos a RELACAO que aparece imediatamente APOS uma
+        clausula FROM/JOIN. Um matcher reconhece FROM/JOIN + a relacao (com
+        delimitador opcional) e:
+          * SO qualifica se a relacao for uma das tabelas internas do grupo;
+          * NUNCA toca em relacoes JA qualificadas (algo.tabela);
+          * NUNCA toca em literais/comentarios (nao casam o padrao FROM/JOIN).
+        """
+        if not sql:
+            return sql
+        tabelas = (
+            "file_manifest", "metadata", "period_index",
+            "group_checkpoint", "datasus_cache", "datasus",
+        )
+        tabelas_cf = {nome.casefold() for nome in tabelas}
+        schema = self.name
+
+        # FROM/JOIN seguido da relacao, com delimitador opcional.
+        rel_re = re.compile(
+            r'\b(FROM|JOIN)\s+'
+            r'(["`\[]?)([A-Za-z_][A-Za-z0-9_]*)(["`\]]?)'
+            r'(?=\s|$|[,;)])',
+            flags=re.IGNORECASE,
+        )
+
+        def _sub(match: re.Match) -> str:
+            keyword = match.group(1)
+            pre_q = match.group(2)
+            nome = match.group(3)
+            if nome.casefold() not in tabelas_cf:
+                return match.group(0)
+            if pre_q:
+                return f"{keyword} {pre_q}{schema}.{nome}{pre_q}"
+            return f"{keyword} {schema}.{nome}"
+
+        return rel_re.sub(_sub, sql)
 
     def _cache_table_exists(self) -> bool:
         if self.connection is None and self.main_connection is not None:
@@ -418,13 +661,41 @@ class _GroupCache:
         "NULLIF(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 2), '')) AS parquet_month"
     )
 
+    def _view_period_native_expr(self) -> str:
+        """FASE 4 (#4): expressoes atend_ano/atend_mes do CAMPO NATIVO para a VIEW S1.
+
+        Em modo S1 a view ``datasus_cache`` era derivada apenas do NOME DO
+        ARQUIVO (parquet_year/parquet_month via ``_VIEW_PERIOD_EXPR``),
+        contrariando ``db/period_fields.py`` (fonte unica de verdade do recorte
+        temporal). Este helper devolve um fragmento SQL (precedido de virgula)
+        que deriva ``atend_ano``/``atend_mes`` do CAMPO NATIVO do grupo — os
+        MESMOS valores que a tabela fisica materializa na FASE 3 (#3).
+
+        Retorna string vazia quando o grupo NAO tem campo de periodo mapeado
+        (a view e criada sem essas colunas, e o UNION trata o grupo como
+        "sem periodo" — ver PARTE 1/#5).
+
+        Mantemos ``parquet_year``/``parquet_month`` (``_VIEW_PERIOD_EXPR``) por
+        COMPATIBILIDADE (testes e caches legados), mas o recorte passa a usar
+        atend_ano/atend_mes em ambos os modos (S1 e TABELA).
+        """
+        pf = PERIOD_FIELDS.get(self.name)
+        if pf is None:
+            return ""
+        pcol = pf.columns[0]
+        # FASE 3B: atend_ano e INTEGER (mesmo tipo da tabela fisica e dos resumos).
+        return f", {ano_int_expr(pcol)} AS {ATEND_ANO}, {mes_expr(pcol)} AS {ATEND_MES}"
+
     def _materialize_as_view(self) -> bool:
         """FASE 2 (S1): (re)cria datasus_cache como VIEW sobre os Parquet do grupo.
 
         Retorna True se a view foi criada. Substitui a tabela fisica,
         eliminando a copia duplicada. Mantem EXATAMENTE as colunas derivadas
-        (parquet_path, parquet_year, parquet_month) que a tabela tinha, para
-        que o restante do pipeline (prepare_question_cache) continue igual.
+        (parquet_path, parquet_year, parquet_month) que a tabela tinha — para
+        compatibilidade — e ADICIONA atend_ano/atend_mes do CAMPO NATIVO
+        (FASE 4/#4), alinhando a view S1 ao mesmo recorte da tabela fisica.
+        Assim o restante do pipeline (prepare_question_cache) usa as colunas
+        fisicas em ambos os modos.
         """
         parquets = self._all_cached_parquets()
         if not parquets:
@@ -445,7 +716,7 @@ class _GroupCache:
                     pass
             self.connection.execute(
                 f"CREATE VIEW {self.name}.datasus_cache AS "
-                f"SELECT *, filename AS parquet_path, {self._VIEW_PERIOD_EXPR} "
+                f"SELECT *, filename AS parquet_path, {self._VIEW_PERIOD_EXPR}{self._view_period_native_expr()} "
                 f"FROM read_parquet([{paths_sql}], union_by_name = true, filename = true)"
             )
             LOGGER.info(
@@ -643,7 +914,7 @@ class _GroupCache:
                     # fallback para AAAA/MM das pastas do caminho. Garante
                     # parquet_year/parquet_month preenchidos já na criação.
                     self.connection.execute(
-                        f"CREATE OR REPLACE TABLE {cache_table} AS SELECT *, filename AS parquet_path, "
+                        f"CREATE OR REPLACE TABLE {cache_table} AS SELECT *, filename AS parquet_path{self._period_projection_exprs()}, "
                         "COALESCE(2000 + CAST(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 1), '') AS INTEGER), "
                         "TRY_CAST(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 1) AS INTEGER)) AS parquet_year, "
                         "COALESCE(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 2), ''), "
@@ -696,6 +967,8 @@ class _GroupCache:
                             )
                         elif col.upper() in batch_by_upper:
                             projection.append('"' + batch_by_upper[col.upper()].replace('"', '""') + '"')
+                        elif self._period_col_projection(col) is not None:
+                            projection.append(self._period_col_projection(col))
                         else:
                             projection.append('CAST(NULL AS VARCHAR) AS "' + esc + '"')
                     col_list = ", ".join('"' + col.replace('"', '""') + '"' for col in table_cols)
@@ -854,7 +1127,7 @@ class _GroupCache:
                 # do caminho (.../<grupo>/<ano>/<mes>/arquivo.parquet). Assim
                 # parquet_year/parquet_month são SEMPRE preenchidos na criação.
                 self.connection.execute(
-                    f"CREATE OR REPLACE TABLE {cache_table} AS SELECT *, filename AS parquet_path, "
+                    f"CREATE OR REPLACE TABLE {cache_table} AS SELECT *, filename AS parquet_path{self._period_projection_exprs()}, "
                     "COALESCE(2000 + CAST(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 1), '') AS INTEGER), "
                     "TRY_CAST(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 1) AS INTEGER)) AS parquet_year, "
                     "COALESCE(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 2), ''), "
@@ -913,6 +1186,8 @@ class _GroupCache:
                         )
                     elif col.upper() in batch_by_upper:
                         projection.append('"' + batch_by_upper[col.upper()].replace('"', '""') + '"')
+                    elif self._period_col_projection(col) is not None:
+                        projection.append(self._period_col_projection(col))
                     else:
                         projection.append('CAST(NULL AS VARCHAR) AS "' + esc + '"')
                 col_list = ", ".join('"' + col.replace('"', '""') + '"' for col in table_cols)

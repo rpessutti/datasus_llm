@@ -16,6 +16,23 @@ Quando já existe um cache persistido, a aplicação ativa a API imediatamente. 
 
 Arquivos Parquet corrompidos são registrados no log, removidos da pasta de origem e do cache, e não interrompem os demais arquivos. Depois da primeira carga, se o manifesto (nome, tamanho e data de modificação) não mudou, a aplicação reutiliza `datasus_cache` e não relê os Parquet na inicialização.
 
+## Modo grupos e view unificada (UNION)
+
+Além do modo legado (uma única tabela `datasus_cache`), a aplicação suporta um **modo grupos**: cada grupo do DATASUS (ex.: `er`, `si`, `ps`, `sp`) vive em seu próprio banco anexado (`<grupo>.datasus_cache`). Para consultar todos ao mesmo tempo, a aplicação materializa a **view unificada** `datasus_query_cache` como um `UNION ALL` dos grupos selecionados para a pergunta.
+
+Decisões de projeto relevantes ao modo grupos:
+
+- **#3 — Colunas de período materializadas na ingestão** (`atend_ano`/`atend_mes`): cada grupo ganha as colunas normalizadas de período como **tabela física** na ingestão, derivadas do campo nativo de período do grupo. Consultas de tempo não dependem de parsing em tempo de execução.
+- **#4 — View unificada alinhada ao campo nativo de período**: o `UNION ALL` da view usa o campo de período **nativo** de cada grupo (não um derivado por nome de arquivo), garantindo que o recorte temporal (`atend_ano`/`atend_mes`) corresponda ao dado real de atendimento.
+- **#5 — Grupos sem campo de período são excluídos do UNION**: grupos que não expõem nenhum campo de período são automaticamente deixados fora da view unificada (evita colunas de período nulas/ambíguas no `UNION ALL`).
+
+Outras otimizações aplicadas:
+
+- **#6 — Schema canônico**: o `UNION` reutiliza o schema canônico já consolidado (S2) em vez de reconsultar o catálogo a cada preparação.
+- **#1 — Qualificação de SQL por parser**: a qualificação de colunas/relações no SQL gerado é feita com uma abordagem estrutural (sem regex arriscada), evitando reescritas incorretas.
+- **#7 — Prefixos de CID pré-computados**: os prefixos de CID reais presentes nos dados são pré-computados na ingestão (tabela `cid_prefixes`) e apenas lidos nas consultas, em vez de escanear colunas de diagnóstico a cada pergunta.
+- **#8/#9/#10 — LIMIT/ORDER BY/projeção mínima**: `execute` respeita o limite da pergunta (fallback `DEFAULT_FETCH_ROWS`); o fallback de coluna ausente reconstrói a view com projeção **mínima** (colunas usadas ∪ faltante), não com todas as colunas; e o prompt do LLM exige `ORDER BY` em toda query com `LIMIT` (resultados reproduzíveis com `preserve_insertion_order=false`).
+
 ## Robustez contra disco removível (USB / HD externo)
 
 Se os dados (`DATASUS_DATA_DIR`/`DATASUS_CACHE_DIR`) ficarem num pen drive ou HD externo, uma desconexão, suspensão ou queda de montagem pode derrubar a aplicação no meio de uma leitura. Para evitar isso, a aplicação agora:

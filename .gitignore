@@ -78,6 +78,8 @@ db/_disasm*.txt
 *.orig
 *.rej
 *.tmp
+# Diretorios de backup de edicao (snapshots manuais de arquivos).
+backup_*/
 
 # ==========================================================================
 # Artefatos de build / distribuicao
@@ -121,3 +123,4 @@ desktop.ini
 # mas nunca versionar caches dentro dos testes
 test/__pycache__/
 *.pyc
+

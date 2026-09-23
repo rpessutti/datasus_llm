@@ -30,10 +30,28 @@ from db.period_fields import (
     ATEND_ANO,
     ATEND_MES,
     ano_expr,
+    ano_int_expr,
     mes_expr,
 )
 
 LOGGER = logging.getLogger("datasus_llm")
+
+# ============================================================================
+# MODO GRUPOS E VIEW UNIFICADA (UNION) - decisoes #3/#4/#5 (documentacao PARTE 8)
+# ----------------------------------------------------------------------------
+# Cada grupo do DATASUS (er, si, ps, sp, ...) vive em seu proprio banco anexado
+# (<grupo>.datasus_cache). A pergunta e respondida sobre a view unificada
+# `datasus_query_cache`, um UNION ALL dos grupos selecionados.
+#
+# #3 - Colunas de periodo MATERIALIZADAS na ingestao: atend_ano/atend_mes entram
+#      como colunas FISICAS de cada grupo (derivadas do campo NATIVO de periodo),
+#      evitando parsing/derivacao em tempo de consulta.
+# #4 - View unificada ALINHADA ao campo NATIVO de periodo de cada grupo: o UNION
+#      usa o campo de periodo real do grupo (nao um derivado por nome de arquivo),
+#      para que o recorte temporal corresponda ao atendimento.
+# #5 - Grupos SEM campo de periodo sao EXCLUIDOS do UNION: evita colunas de
+#      periodo nulas/ambiguas no UNION ALL.
+# ============================================================================
 
 
 # Nomes reservados que NAO sao grupos (banco principal, fallback e a pasta raiz
@@ -75,6 +93,8 @@ class DatasusCache:
         # 16 grupos E recomputa a uniao de ~469 colunas A CADA pergunta. O
         # conteudo e estavel durante a execucao (so muda com nova ingestao).
         self._canonical_schema_cache: dict[str, Any] | None = None
+        # >>> PARTE 7 (#9): ultima SQL preparada (p/ reprojecao minima). <<<
+        self._last_sql: str | None = None
         # >>> FASE 3 (S3): VIEW UNIFICADA (lazy) em vez de TEMP TABLE <<<
         # Quando True, datasus_query_cache e criada como VIEW (nao materializada),
         # permitindo push-down do filtro e leitura lazy. Reversivel via
@@ -189,6 +209,15 @@ class DatasusCache:
             "CREATE TABLE IF NOT EXISTS cache_checkpoint ("
             "key VARCHAR PRIMARY KEY, value VARCHAR)"
         )
+        # >>> PARTE 6 (#7): PRE-COMPUTACAO DE PREFIXOS DE CID <<<
+        # `_known_cid_prefixes` fazia DESCRIBE + SELECT DISTINCT SUBSTR por
+        # coluna de diagnostico de cada grupo A CADA REQUISICAO. Agora os
+        # prefixos sao pre-computados na ingestao nesta tabela e apenas LIDOS
+        # nas consultas subsequentes. Idempotente (PRIMARY KEY + INSERT OR IGNORE).
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS cid_prefixes ("
+            "prefixo VARCHAR PRIMARY KEY)"
+        )
         # NOVO: carga UNICA do CID_10.CSV no DuckDB (tabela cid10).
         # A LLM consulta esta tabela para decidir o CID, em vez de o Python
         # ler o CSV a cada pergunta. Idempotente: so carrega se a tabela nao
@@ -296,6 +325,50 @@ class DatasusCache:
         # Mantem apenas as que existem de fato no conjunto disponivel (case-insensitive).
         upper_map = {c.upper(): c for c in available}
         return {upper_map[c.upper()] for c in referenced if c.upper() in upper_map}
+
+    def _ensure_groups_attached(self) -> None:
+        """Garante que os bancos dos grupos estejam anexados na conexao principal.
+
+        Antes, esse ATTACH sob demanda ficava embutido no laço de montagem do
+        UNION em ``prepare_question_cache``, o que exigia reconsultar o catalogo
+        (``duckdb_databases``/``duckdb_tables``/``duckdb_views``) POR GRUPO A
+        CADA PERGUNTA. Aqui ele e isolado e so faz o necessario: para cada grupo
+        cujo banco ainda nao esta anexado, tenta o ATTACH (READ_WRITE, com
+        fallback READ_ONLY). A existencia de ``datasus_cache`` (TABELA ou VIEW)
+        NAO e reconsultada aqui — ela vem do cache S2 (ver
+        :meth:`_get_canonical_schema`).
+
+        Chamado por ``prepare_question_cache`` antes de ``_get_canonical_schema``
+        para manter o comportamento de "attach sob demanda" sem o custo de
+        reconsultas de catalogo por grupo.
+        """
+        for name, group in self.groups.items():
+            safe_name = name.replace('"', '""')
+            try:
+                db_check = self.connection.execute(
+                    "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = ?",
+                    [safe_name]
+                ).fetchone()
+                if db_check and db_check[0] > 0:
+                    continue  # já anexado
+                try:
+                    self.connection.execute(
+                        f"ATTACH IF NOT EXISTS '{group.db_path}' AS {safe_name} (READ_WRITE)"
+                    )
+                except duckdb.IOException as lock_exc:
+                    if "Could not set lock" in str(lock_exc):
+                        LOGGER.error(
+                            "grupo %s: arquivo %s BLOQUEADO por outro processo "
+                            "(conflicting lock). Verifique com `lsof %s`. "
+                            "Tentando READ_ONLY...",
+                            name, group.db_path, group.db_path,
+                        )
+                    self.connection.execute(
+                        f"ATTACH IF NOT EXISTS '{group.db_path}' AS {safe_name} (READ_ONLY)"
+                    )
+                LOGGER.info("grupo %s: anexado como banco %s (sob demanda)", name, safe_name)
+            except Exception as attach_exc:
+                LOGGER.warning("grupo %s: falha ao anexar banco: %s", name, attach_exc)
 
     def _get_canonical_schema(self) -> tuple[set[str], dict[str, set[str]]]:
         """FASE 3 (S2): cache do schema canonico dos grupos.
@@ -447,6 +520,106 @@ class DatasusCache:
         )
         rows = self._fetch_scalar("SELECT COUNT(*) FROM cid10", default=0)
         LOGGER.info("tabela cid10 carregada no DuckDB linhas=%s path=%s", rows, csv_path)
+
+
+    # >>> PARTE 6 (#7): PREFIXOS DE CID PRE-COMPUTADOS <<<
+    def _cid_diagnosis_columns(self, relation: str) -> list[str]:
+        """Colunas de diagnostico (CID) reais de ``relation`` (best-effort)."""
+        try:
+            desc = self.connection.execute(f"DESCRIBE {relation}").fetchall()
+        except Exception as exc:
+            LOGGER.debug("cid_prefixes: DESCRIBE falhou p/ %s: %s", relation, exc)
+            return []
+        cols_upper = {str(row[0]).upper(): str(row[0]) for row in desc}
+        diag = [
+            cols_upper[c.upper()] for c in DIAGNOSIS_COLUMN_NAMES if c.upper() in cols_upper
+        ]
+        if not diag:
+            diag = [
+                real for up, real in cols_upper.items()
+                if "CID" in up or "DIAG" in up or "CAUSA" in up
+            ]
+        return diag
+
+    def _populate_cid_prefixes(self, force: bool = False, min_len: int = 3, limit: int = 500) -> int:
+        """Pre-computa os prefixos de CID reais dos dados na tabela cid_prefixes.
+
+        Idempotente: se a tabela ja tem linhas e force=False, nao recomputa.
+        Retorna o numero de prefixos da tabela ao final.
+        """
+        try:
+            existentes = int(self._fetch_scalar("SELECT COUNT(*) FROM cid_prefixes", default=0) or 0)
+        except Exception:
+            existentes = 0
+        if existentes > 0 and not force:
+            LOGGER.info("cid_prefixes: ja populado (%d prefixos); nada a fazer", existentes)
+            return existentes
+
+        prefixos: set[str] = set()
+        relations: list[str] = []
+        if self.groups:
+            for name in self.groups:
+                safe = name.replace('"', '""')
+                relations.append('"' + safe + '".datasus_cache')
+        else:
+            relations.append("datasus_cache")
+
+        for relation in relations:
+            diag_cols = self._cid_diagnosis_columns(relation)
+            for col in diag_cols[:10]:
+                esc = col.replace('"', '""')
+                sql = (
+                    f"SELECT DISTINCT SUBSTR(UPPER(TRIM(CAST(\"{esc}\" AS VARCHAR))), 1, {min_len}) AS p "
+                    f"FROM {relation} "
+                    f"WHERE \"{esc}\" IS NOT NULL AND TRIM(CAST(\"{esc}\" AS VARCHAR)) <> ''"
+                )
+                try:
+                    for row in self.connection.execute(sql).fetchmany(limit):
+                        val = str(row[0] or "").upper()
+                        if len(val) >= 2 and val[0].isalpha():
+                            prefixos.add(val)
+                except Exception as exc:
+                    LOGGER.debug("cid_prefixes: falha em %s.%s: %s", relation, col, exc)
+                    continue
+
+        # Prefixos do de-para OFICIAL (nunca devem faltar).
+        try:
+            from db.cid_map import CID_ALIASES, get_cid_map
+            for codigos in CID_ALIASES.values():
+                for codigo in codigos:
+                    prefixos.add(codigo.upper()[:max(2, min_len)])
+            cid_map = get_cid_map()
+            if cid_map.loaded:
+                for entry in cid_map.entries:
+                    prefixos.add(entry.inicio.upper()[:3])
+        except Exception as exc:
+            LOGGER.debug("cid_prefixes: de-para indisponivel: %s", exc)
+
+        prefixos = {p for p in prefixos if len(p) >= 2 and p[0].isalpha()}
+        if prefixos:
+            try:
+                self.connection.executemany(
+                    "INSERT OR IGNORE INTO cid_prefixes (prefixo) VALUES (?)",
+                    [(p,) for p in sorted(prefixos)],
+                )
+            except Exception as exc:
+                LOGGER.warning("cid_prefixes: falha ao inserir: %s", exc)
+        total = int(self._fetch_scalar("SELECT COUNT(*) FROM cid_prefixes", default=0) or 0)
+        LOGGER.info("cid_prefixes: populados %d prefixos (tabela total=%d)", len(prefixos), total)
+        return total
+
+    def get_cid_prefixes(self, min_len: int = 2) -> list[str]:
+        """Le os prefixos de CID pre-computados (PARTE 6). [] se vazio/ausente."""
+        try:
+            rows = self.connection.execute("SELECT prefixo FROM cid_prefixes").fetchall()
+        except Exception:
+            return []
+        vals = {
+            str(r[0]).upper() for r in rows
+            if r and r[0] is not None and len(str(r[0])) >= 2 and str(r[0])[0].isalpha()
+        }
+        return sorted(vals)
+
 
     def _grupo_source_signature(self, grupo_name: str) -> float:
         """Assinatura de versao da FONTE de colunas de um grupo.
@@ -1285,11 +1458,19 @@ class DatasusCache:
         return periods
 
     @log_calls
-    def prepare_question_cache(self, question: str, request_id: str, sql: str | None = None) -> dict[str, Any]:
+    def prepare_question_cache(
+        self,
+        question: str,
+        request_id: str,
+        sql: str | None = None,
+        extra_columns: set[str] | None = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         # Guarda a pergunta corrente para permitir RECONSTRUIR a tabela temporaria
         # em ``execute()`` caso a SQL mude de colunas depois (refazer/revisao).
         self._last_question = question
+        # >>> PARTE 7 (#9): guarda a ULTIMA SQL para reprojecao minima no fallback.
+        self._last_sql = sql
         LOGGER.info("question cache start request_id=%s question_length=%d", request_id, len(question))
         # >>> CAMINHO RAPIDO: LEITURA DIRETA DO DUCKDB (sem Parquet no disco) <<<
         # Com cache DuckDB (self.groups), resolve o recorte temporal pelos
@@ -1332,78 +1513,35 @@ class DatasusCache:
             # de re-ler os arquivos Parquet do disco. Isso evita OOM e torna
             # as consultas muito mais rapidas.
             group_selects = []
-            group_tables = []  # (safe_name) para grupos que tem a tabela
-            for name, group in self.groups.items():
-                safe_name = name.replace('"', '""')
-                try:
-                    db_check = self.connection.execute(
-                        "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = ?",
-                        [safe_name]
-                    ).fetchone()
-                    if not db_check or db_check[0] == 0:
-                        try:
-                            # Usa READ_WRITE quando possivel (o banco do grupo e
-                            # escrito pela ingestao); so cai para READ_ONLY se o
-                            # arquivo estiver travado por outro processo. Fix 4:
-                            # mensagem clara quando o erro for de lock conflitante.
-                            try:
-                                self.connection.execute(
-                                    f"ATTACH IF NOT EXISTS '{group.db_path}' AS {safe_name} (READ_WRITE)"
-                                )
-                            except duckdb.IOException as lock_exc:
-                                if "Could not set lock" in str(lock_exc):
-                                    LOGGER.error(
-                                        "grupo %s: arquivo %s BLOQUEADO por outro processo "
-                                        "(conflicting lock). Verifique com `lsof %s`. "
-                                        "Tentando READ_ONLY...",
-                                        name, group.db_path, group.db_path,
-                                    )
-                                self.connection.execute(
-                                    f"ATTACH IF NOT EXISTS '{group.db_path}' AS {safe_name} (READ_ONLY)"
-                                )
-                            LOGGER.info("grupo %s: anexado como banco %s (sob demanda)", name, safe_name)
-                        except Exception as attach_exc:
-                            LOGGER.warning("grupo %s: falha ao anexar banco: %s", name, attach_exc)
-                            continue
-
-                    # Aceita datasus_cache como TABLE (modo legado) OU VIEW (S1).
-                    # No modo S1 (DATASUS_CACHE_AS_VIEW=true) o grupo nao tem
-                    # tabela fisica; sem checar duckdb_views() o grupo seria
-                    # ignorado e a consulta retornaria vazio.
-                    rel_exists = self.connection.execute(
-                        "SELECT COUNT(*) FROM duckdb_tables() "
-                        "WHERE database_name = ? AND table_name = 'datasus_cache'",
-                        [safe_name]
-                    ).fetchone()[0]
-                    if not rel_exists:
-                        rel_exists = self.connection.execute(
-                            "SELECT COUNT(*) FROM duckdb_views() "
-                            "WHERE database_name = ? AND view_name = 'datasus_cache'",
-                            [safe_name]
-                        ).fetchone()[0]
-                    if not rel_exists:
-                        continue
-                    group_tables.append((safe_name, name))
-                except Exception as e:
-                    LOGGER.warning("grupo %s: não foi possível acessar tabela anexada: %s", name, e)
-
-            if group_tables:
-                # >>> FASE 3 (S2): schema canonico memoizado <<<
-                # Antes rodavamos DESCRIBE em cada um dos ~16 grupos E
-                # recomputavamos a uniao das ~469 colunas a CADA pergunta.
-                # Agora o resultado e cacheado em self._canonical_schema_cache
-                # (invalidado em _invalidate_canonical_schema apos mudancas
-                # estruturais), tornando o custo O(1) por pergunta.
+            # >>> FASE 3 (S2): schema canonico memoizado como fonte unica <<<
+            # Antes rodavamos, POR GRUPO E A CADA PERGUNTA, consultas de catalogo
+            # (duckdb_databases/duckdb_tables/duckdb_views) para decidir se o
+            # grupo entrava no UNION. Agora reaproveitamos o cache S2
+            # (self._canonical_schema_cache), que ja sabe quais grupos tem
+            # ``datasus_cache`` (TABELA ou VIEW) e quais colunas projetar.
+            #
+            # O ATTACH sob demanda continua: se um grupo ainda nao estiver
+            # anexado, anexamos antes de (re)computar o schema S2. Isso mantem o
+            # comportamento anterior para o caso (raro) de grupo recém-criado.
+            self._ensure_groups_attached()
+            all_columns, group_columns = self._get_canonical_schema()
+            # >>> GUARD: S2 vazio mas ha grupos <<<
+            # Se o cache S2 nao conhece nenhum grupo, mas ``self.groups`` nao
+            # esta vazio (ex.: grupos anexados/ingeridos apos a ultima
+            # invalidacao), descartamos e recomputamos UMA vez antes de desistir.
+            if not group_columns and self.groups:
+                self._invalidate_canonical_schema()
                 all_columns, group_columns = self._get_canonical_schema()
-                # Fonte unica de verdade dos grupos efetivamente disponiveis
-                # (TABELA ou VIEW), a partir do cache S2 — evita divergencia
-                # entre a lista do attach e o schema cacheado.
-                _s2_safe_to_name = (self._canonical_schema_cache or {}).get("safe_to_name", {})
-                s2_groups = [
-                    (safe, _s2_safe_to_name.get(safe, safe))
-                    for safe in (self._canonical_schema_cache or {}).get("safe_names", [])
-                    if safe in group_columns
-                ]
+            # Fonte unica de verdade dos grupos efetivamente disponiveis
+            # (TABELA ou VIEW), a partir do cache S2.
+            _s2_safe_to_name = (self._canonical_schema_cache or {}).get("safe_to_name", {})
+            s2_groups = [
+                (safe, _s2_safe_to_name.get(safe, safe))
+                for safe in (self._canonical_schema_cache or {}).get("safe_names", [])
+                if safe in group_columns
+            ]
+
+            if s2_groups:
 
                 # >>> OTIMIZACAO OOM: projecao MINIMA <<<
                 # Quando a SQL final e conhecida, projetamos apenas as colunas
@@ -1429,6 +1567,20 @@ class DatasusCache:
                         referenced.add(ATEND_ANO)
                         referenced.add(ATEND_MES)
                         projected_columns = referenced
+                # >>> PARTE 7 (#9): colunas EXTRA forcam a projecao a incluir
+                # a coluna FALTANTE sem degradar para TODAS as ~469 colunas.
+                # Usado pelo fallback de 'coluna ausente' em execute().
+                if extra_columns:
+                    filtrados = {c for c in extra_columns if c in all_columns}
+                    if filtrados:
+                        projected_columns = set(projected_columns) | filtrados
+                        projected_columns.add(ATEND_ANO)
+                        projected_columns.add(ATEND_MES)
+                        LOGGER.info(
+                            "question cache reprojecao minima (+%d colunas faltantes) "
+                            "request_id=%s colunas=%d de %d",
+                            len(filtrados), request_id, len(projected_columns), len(all_columns),
+                        )
                         LOGGER.info(
                             "question cache projeção mínima (VIEW) request_id=%s colunas=%d de %d",
                             request_id, len(projected_columns), len(all_columns),
@@ -1438,24 +1590,57 @@ class DatasusCache:
                     cols = group_columns[safe_name]
                     pf = PERIOD_FIELDS.get(name)
                     if pf is None:
-                        # Sem campo nativo: nao filtra e expoe periodo NULL.
-                        ano_sql = "CAST(NULL AS VARCHAR)"
-                        mes_sql = "CAST(NULL AS VARCHAR)"
-                        where_group = "TRUE"
+                        # >>> CORRECAO (grupo sem campo de periodo) <<<
+                        # Antes, um grupo SEM campo nativo de periodo entrava no
+                        # UNION com atend_ano/atend_mes = NULL e WHERE TRUE, isto
+                        # e, SEM recorte temporal. Isso CONTAMINAVA o resultado:
+                        # as linhas desse grupo apareciam em QUALQUER periodo,
+                        # independentemente do ano/mes pedido na pergunta.
+                        #
+                        # Agora o grupo e EXCLUIDO do UNION (nao gera ATEND_ANO/
+                        # ATEND_MES nulos nem entra sem filtro). Se nenhum grupo
+                        # sobrar, group_selects fica vazio e o fluxo cai no
+                        # comportamento ja existente ("Nenhum periodo do cache
+                        # corresponde ao informado na pergunta."), sem excecao nova.
+                        LOGGER.warning(
+                            "grupo %s: sem campo de período mapeado em PERIOD_FIELDS; "
+                            "EXCLUÍDO do UNION por não respeitar o recorte temporal "
+                            "(evita contaminação por linhas fora do período).",
+                            name,
+                        )
+                        continue
+                    pcol = pf.columns[0]                         # campo de data nativo do grupo
+                    # >>> FASE 3 (#3.5): usa as colunas FISICAS atend_ano/atend_mes <<<
+                    # Se a tabela do grupo ja materializa atend_ano/atend_mes
+                    # (FASE 3), referenciamos as colunas fisicas — o filtro vira
+                    # push-down nativo. Em caches legados (sem as colunas), caimos
+                    # no calculo derivado a partir do campo nativo, mantendo o
+                    # comportamento anterior.
+                    if ATEND_ANO in cols and ATEND_MES in cols:
+                        ano_sql = f'"{ATEND_ANO}"'                # coluna fisica (push-down)
+                        mes_sql = f'"{ATEND_MES}"'                # coluna fisica (push-down)
                     else:
-                        pcol = pf.columns[0]                         # campo de data nativo do grupo
-                        ano_sql = ano_expr(pcol)                       # ano (YYYY) derivado
-                        mes_sql = mes_expr(pcol)                       # mes (MM) derivado
-                        conds = []
-                        if period_years:
-                            anos_lit = ", ".join(f"'{y}'" for y in period_years)
-                            conds.append(f"{ano_sql} IN ({anos_lit})")
-                        if period_months:
-                            meses_lit = ", ".join(
-                                "'" + str(mo).zfill(2) + "'" for mo in period_months
-                            )
-                            conds.append(f"{mes_sql} IN ({meses_lit})")
-                        where_group = " AND ".join(conds) if conds else "TRUE"
+                        # FASE 3B: atend_ano e INTEGER; o fallback derivado tambem
+                        # precisa ser INTEGER para nao misturar tipos no UNION ALL.
+                        ano_sql = ano_int_expr(pcol)              # ano (YYYY) INTEGER derivado
+                        mes_sql = mes_expr(pcol)                  # mes (MM) derivado
+                    conds = []
+                    if period_years:
+                        # FASE 3B: atend_ano e INTEGER na tabela/view/resumos.
+                        # Monta literais INTEIROS (ex.: 2022) para comparacao
+                        # numerica nativa e push-down. Fallback para string caso
+                        # o ano nao seja numerico (defensivo).
+                        def _ano_lit(y: str) -> str:
+                            ys = str(y).strip()
+                            return ys if ys.lstrip("-").isdigit() else "'" + ys.replace("'", "''") + "'"
+                        anos_lit = ", ".join(_ano_lit(y) for y in period_years)
+                        conds.append(f"{ano_sql} IN ({anos_lit})")
+                    if period_months:
+                        meses_lit = ", ".join(
+                            "'" + str(mo).zfill(2) + "'" for mo in period_months
+                        )
+                        conds.append(f"{mes_sql} IN ({meses_lit})")
+                    where_group = " AND ".join(conds) if conds else "TRUE"
 
                     projections = []
                     for col in projected_columns:
@@ -1507,7 +1692,7 @@ class DatasusCache:
         self.connection.execute(
             "CREATE OR REPLACE TEMP VIEW datasus_query_cache AS "
             "SELECT *, "
-            f"CAST(NULL AS VARCHAR) AS {ATEND_ANO}, "
+            f"CAST(NULL AS INTEGER) AS {ATEND_ANO}, "
             f"CAST(NULL AS VARCHAR) AS {ATEND_MES} "
             "FROM datasus_query_files"
         )
@@ -1605,8 +1790,11 @@ class DatasusCache:
         return context
 
     @log_calls
-    def execute(self, sql: str, request_id: str) -> list[dict[str, Any]]:
+    def execute(self, sql: str, request_id: str, limite: int | None = None) -> list[dict[str, Any]]:
         started = time.perf_counter()
+        # >>> PARTE 7 (#8): respeita o limite REAL da pergunta. Antes o
+        # fetchmany era FIXO em 100. Fallback: DEFAULT_FETCH_ROWS.
+        _fetch_n = int(limite) if (limite and int(limite) > 0) else DEFAULT_FETCH_ROWS
         LOGGER.info("duckdb query start request_id=%s sql_length=%d sql=%s", request_id, len(sql), sql)
         uses_query_cache = bool(re.search(r"\bdatasus_query_cache\b", sql, flags=re.IGNORECASE))
         # S3: datasus_query_cache pode ser VIEW (DATASUS_UNIFIED_VIEW) ou TEMP
@@ -1656,8 +1844,14 @@ class DatasusCache:
                     missing, request_id,
                 )
                 try:
+                    # >>> PARTE 7 (#9): reprojecao MINIMA. Em vez de
+                    # reconstruir com sql=None (TODAS as ~469 colunas),
+                    # passamos a coluna FALTANTE como extra_columns, mantendo
+                    # a projecao minima (colunas usadas + faltante + periodo).
+                    _extra = {missing} if missing else None
                     self.prepare_question_cache(
-                        self._last_question, request_id, sql=None
+                        self._last_question, request_id, sql=self._last_sql,
+                        extra_columns=_extra,
                     )
                     cursor = self.connection.execute(sql)
                     columns = [d[0] for d in cursor.description or []]
@@ -1665,7 +1859,7 @@ class DatasusCache:
                         "duckdb query complete (após reconstrução) request_id=%s columns=%s",
                         request_id, columns,
                     )
-                    rows = [dict(zip(columns, row)) for row in cursor.fetchmany(100)]
+                    rows = [dict(zip(columns, row)) for row in cursor.fetchmany(_fetch_n)]
                     LOGGER.info(
                         "duckdb query complete request_id=%s rows_returned=%d "
                         "result_empty=%s duration_ms=%.2f",
@@ -1714,8 +1908,8 @@ class DatasusCache:
                 raise
         columns = [description[0] for description in cursor.description or []]
         LOGGER.info("duckdb query fetch start request_id=%s columns=%s", request_id, columns)
-        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(100)]
-        LOGGER.info("duckdb query complete request_id=%s rows_returned=%d result_empty=%s duration_ms=%.2f", request_id, len(rows), not rows, (time.perf_counter() - started) * 1000)
+        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(_fetch_n)]
+        LOGGER.info("duckdb query complete request_id=%s rows_returned=%d limite=%d result_empty=%s duration_ms=%.2f", request_id, len(rows), _fetch_n, not rows, (time.perf_counter() - started) * 1000)
         return rows
 
     @staticmethod
@@ -2273,6 +2467,11 @@ class DatasusCache:
                 self.settings.cache_dir, self.settings.official_cache_dir
             )
             result["synced_to_official"] = synced
+            # >>> PARTE 6 (#7): pre-computa os prefixos de CID apos a ingestao <<<
+            try:
+                result["cid_prefixes"] = self._populate_cid_prefixes()
+            except Exception as e:
+                LOGGER.warning("falha ao pre-computar prefixos de CID: %s", e)
         return result
 
     def build_summary_tables(self) -> dict[str, Any]:

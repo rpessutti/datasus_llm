@@ -105,7 +105,7 @@ class _AskMixin(_ServiceBase):
                     request_id, sql[:200],
                 )
             try:
-                rows = self.cache.execute(sql, request_id)
+                rows = self.cache.execute(sql, request_id, limite=limite_usuario)
             except Exception as exec_err:
                 # >>> MELHORIA: Se a execução falhar no DuckDB, reenvia ao LLM para refazer a query <<<
                 LOGGER.warning(
@@ -165,9 +165,12 @@ class _AskMixin(_ServiceBase):
                         )
                 # >>> CORREÇÃO G: cast de colunas CRUAS de ano na SQL refeita. <<<
                 sql_refeita = self._fix_raw_year_casts(sql_refeita, request_id)
+                # >>> CORREÇÃO I: cast de atend_ano (VARCHAR->INTEGER) em
+                # comparações numéricas (BETWEEN, =, IN com inteiros...). <<<
+                sql_refeita = self._fix_atend_ano_casts(sql_refeita, request_id)
                 # >>> CORREÇÃO DATA: remove funções de data do sistema na refeita. <<<
                 sql_refeita = self._fix_system_date_functions(sql_refeita, request_id)
-                rows = self.cache.execute(sql_refeita, request_id)
+                rows = self.cache.execute(sql_refeita, request_id, limite=limite_usuario)
                 sql = sql_refeita
             if not rows:
                 # >>> CORREÇÃO B: um resultado vazio é resposta LEGÍTIMA. Falhas na
@@ -195,7 +198,7 @@ class _AskMixin(_ServiceBase):
         sql = self._heuristic_sql(question, limite_usuario)
         if re.search(r"\bdatasus_query_cache\b", sql, flags=re.IGNORECASE):
             cache_scope = self.cache.prepare_question_cache(question, request_id, sql=sql)
-        rows = self.cache.execute(sql, request_id)
+        rows = self.cache.execute(sql, request_id, limite=limite_usuario)
         answer = self._format_local_answer(question, rows)
         # Segunda interação: usar o módulo llm_grafic para gerar gráfico dinâmico via LLM
         chart = self.llm_grafic.gerar_grafico_llm(rows, question, tipo_grafico=tipo_grafico) if self.llm_grafic else None

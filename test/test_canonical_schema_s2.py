@@ -137,6 +137,66 @@ class CanonicalSchemaS2Test(unittest.TestCase):
         finally:
             c.close()
 
+    def test_prepare_reaproveita_s2_sem_reconsultar_catalogo_por_grupo(self) -> None:
+        """PARTE 2 (#6): prepare_question_cache NÃO reconsulta o catálogo por grupo.
+
+        Antes, o laço de montagem do UNION rodava, POR GRUPO E A CADA PERGUNTA,
+        consultas a ``duckdb_tables``/``duckdb_views`` para decidir se o grupo
+        entrava. Agora ele reaproveita o cache S2 (memoizado).
+
+        Estratégia: aquecemos o S2 (``_get_canonical_schema``) e então contamos
+        quantas queries a ``duckdb_tables``/``duckdb_views`` são emitidas durante
+        ``prepare_question_cache``. Com o S2 quente, devem ser ZERO.
+
+        Instrumentação: como a conexão DuckDB não permite sobrescrever
+        ``execute``, envolvemos a conexão num PROXY que delega todo o resto e
+        apenas conta as queries de catálogo.
+        """
+        c = self._cache()
+        try:
+            # Aquece o cache S2 (baseline).
+            c._get_canonical_schema()
+            self.assertIsNotNone(c._canonical_schema_cache)
+
+            catalog_hits = {"tables": 0, "views": 0}
+            real_conn = c.connection
+
+            class _CountingConn:
+                """Proxy que delega para a conexão real e conta queries de catálogo."""
+
+                def __init__(self, inner, hits):
+                    self._inner = inner
+                    self._hits = hits
+
+                def execute(self, query, *args, **kwargs):
+                    q = query if isinstance(query, str) else str(query)
+                    if "duckdb_tables()" in q:
+                        self._hits["tables"] += 1
+                    elif "duckdb_views()" in q:
+                        self._hits["views"] += 1
+                    return self._inner.execute(query, *args, **kwargs)
+
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+            c.connection = _CountingConn(real_conn, catalog_hits)  # type: ignore[assignment]
+            try:
+                c.prepare_question_cache(
+                    "casos de dengue em maio de 2022",
+                    "req_p2",
+                    sql="SELECT COUNT(*) FROM datasus_query_cache",
+                )
+            finally:
+                c.connection = real_conn  # type: ignore[assignment]
+
+            self.assertEqual(
+                catalog_hits, {"tables": 0, "views": 0},
+                "prepare_question_cache reconsultou o catálogo por grupo mesmo com S2 quente: "
+                f"{catalog_hits}",
+            )
+        finally:
+            c.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
