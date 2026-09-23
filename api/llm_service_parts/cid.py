@@ -584,6 +584,20 @@ class _CidMixin(_ServiceBase):
         ):
             _cod = _m.group(1).upper().replace(".", "")
             usados.add(_cod)
+        # >>> BUG (lista de CIDs em IN): o LLM tambem gera o filtro de CID como
+        # ``... IN ('M05%', 'M06%', 'M10%')``. Sem extrair esses literais, a
+        # validacao A1 nao enxergava os CIDs usados (retornava [] cedo) e a
+        # clausula IN -- que faz igualdade EXATA contra strings com coringa e
+        # logo retorna 0 linhas -- passava intacta. Extrai os codigos do IN
+        # (removendo o '%' final) para a validacao/igualdade de conjuntos.
+        for _m in re.finditer(
+            r"IN\s*\(\s*['\"]([A-Za-z]\d{2}(?:\.?\d)?)%?['\"](?:\s*,\s*['\"]([A-Za-z]\d{2}(?:\.?\d)?)%?['\"])*\s*\)",
+            sql,
+            flags=re.IGNORECASE,
+        ):
+            for _lit in re.findall(r"['\"]([A-Za-z]\d{2}(?:\.?\d)?)%?['\"]", _m.group(0)):
+                _cod = _lit.upper().replace(".", "")
+                usados.add(_cod)
         if not usados:
             return []
 
@@ -656,6 +670,77 @@ class _CidMixin(_ServiceBase):
                 request_id,
             )
         return invalidos
+
+    def _normalize_cid_in_filters(self, sql: str, request_id: str = "") -> str:
+        """Reescreve filtros CID no formato de lista ``IN ('M05%', 'M06%', ...)``.
+
+        >>> BUG (lista de CIDs retornava 0 linhas) <<<
+        Para perguntas com LISTA de CIDs (ex.: 'CID M05,M06,M10'), o LLM
+        frequentemente gera uma clausula ``IN`` com literais terminados no
+        caractere coringa::
+
+            UPPER(TRIM(CAST("CIDPRI" AS VARCHAR))) IN ('M05%', 'M06%', 'M10%')
+
+        Isso esta SEMANTICAMENTE ERRADO: o ``IN`` faz IGUALDADE EXATA contra as
+        strings literais (incluindo o coringa no meio), e NENHUM codigo real e
+        igual a essas strings -- logo, 0 linhas. O correto e uma disjuncao de
+        ``LIKE``::
+
+            (UPPER(...) LIKE 'M05%' OR UPPER(...) LIKE 'M06%' OR ...)
+
+        Esta reescrita e DETERMINISTICA e IDEMPOTENTE:
+          * so age quando TODOS os literais da lista parecem prefixos de CID
+            (letra + 2-3 digitos, com ou sem coringa final, com ou sem ponto);
+          * reescreve cada literal para ``LIKE 'COD%'`` (prefixo), preservando
+            subcategorias que a igualdade curta perderia;
+          * apos a reescrita, os LIKEs seguem para
+            :meth:`_expand_cid_filters_multi_column`, que os replica para TODAS
+            as colunas de diagnostico do escopo.
+        """
+        if not sql:
+            return sql
+        if not re.search(r"\bIN\s*\(", sql, flags=re.IGNORECASE):
+            return sql
+
+        # Literal de CID dentro do IN: aspas simples/duplas, coringa final
+        # opcional e ponto decimal opcional. Ex.: 'M05%', "a90", 'G12.1%'.
+        lit = r'[\'"]' + '([A-Za-z]' + r'\d{2}(?:\.?\d)?)' + r'%?[\'"]'
+        # Expressao de coluna: UPPER(TRIM(CAST("COL" AS VARCHAR))) ou "COL".
+        col_expr = (
+            r'(?:(?:UPPER\s*\(\s*)?(?:TRIM\s*\(\s*)?CAST\(\s*"([A-Za-z0-9_]+)"\s+AS\s+VARCHAR\s*\)\s*\)?\s*\)?'
+            r'|(?:"([A-Za-z0-9_]+)"))'
+        )
+        padrao = re.compile(
+            col_expr + r'\s+(?:NOT\s+)?IN\s*\(\s*(' + lit + r'(?:\s*,\s*' + lit + r')*)\s*\)',
+            flags=re.IGNORECASE,
+        )
+
+        mudou = False
+
+        def _sub(m: "re.Match[str]") -> str:
+            nonlocal mudou
+            col = m.group(1) or m.group(2)
+            lista = m.group(3)
+            codigos = [c.upper().replace('.', '') for c in re.findall(lit, lista)]
+            if not codigos:
+                return m.group(0)
+            termos = " OR ".join(
+                'UPPER(TRIM(CAST("' + col + '" AS VARCHAR))) LIKE ' + "'" + cod + "%'"
+                for cod in codigos
+            )
+            mudou = True
+            return "(" + termos + ")"
+
+        novo = padrao.sub(_sub, sql)
+        if mudou:
+            LOGGER.warning(
+                "filtro CID IN(...) reescrito para disjuncao LIKE "
+                "(o IN comparava literalmente strings com coringa, "
+                "retornando 0 linhas). request_id=%s",
+                request_id,
+            )
+        return novo
+
 
     def _expand_cid_filters_multi_column(
         self, sql: str, real_columns: list[str], request_id: str = ""

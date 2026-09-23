@@ -663,6 +663,13 @@ class _GenerateMixin(_ServiceBase):
                         flags=re.IGNORECASE,
                     ) if re.search(r"\bWHERE\b", sql, flags=re.IGNORECASE) else sql
 
+        # >>> BUG (lista de CIDs em IN retornava 0 linhas): o LLM as vezes
+        # gera ``... IN ('M05%', 'M06%', 'M10%')``, que faz IGUALDADE EXATA
+        # contra strings com o coringa dentro -- nenhum codigo real casa, logo
+        # 0 linhas. Reescreve para disjuncao de LIKE ANTES da expansao para
+        # todas as colunas (o LIKE resultante e entao replicado abaixo).
+        sql = self._normalize_cid_in_filters(sql, request_id)
+
         # >>> CORRECAO H (multi-coluna CID): expande QUALQUER filtro CID que
         # use UMA coluna de diagnostico para TODAS as colunas de diagnostico
         # do escopo (SP_CIDPRI, PA_CIDPRI, DIAG_PRINC, CIDPRI, ...).

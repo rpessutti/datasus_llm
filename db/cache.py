@@ -1379,9 +1379,25 @@ class DatasusCache:
         if not available:
             return []
         periods_available = {(y, m) for _, y, m in available}
-        years, months, recent_period_keys, agrupar_por_mes = self._parse_periods(
-            question, periods_available
-        )
+        # >>> CORRECAO (pergunta SEM periodo): nao falha mais. <<<
+        # Quando a pergunta NAO informa ano/mes (ex.: "cids M05,M06,M10"), o
+        # _parse_periods levanta ValueError("Informe a pergunta um ano, mes...").
+        # Antes essa excecao escapava de prepare_question_cache (que, em ask.py,
+        # so captura RuntimeError) e derrubava a requisicao -- MESMO com CIDs
+        # VALIDOS. Agora tratamos esse caso degradando para TODOS os periodos
+        # disponiveis no cache, que e exatamente a intencao do fallback de
+        # ask.py ("tentar com todos os periodos"). Assim a consulta roda.
+        try:
+            years, months, recent_period_keys, agrupar_por_mes = self._parse_periods(
+                question, periods_available
+            )
+        except ValueError as period_exc:
+            LOGGER.warning(
+                "pergunta sem período interpretável (%s); usando TODOS os %d "
+                "períodos disponíveis do cache.",
+                period_exc, len(periods_available),
+            )
+            years, months, recent_period_keys, agrupar_por_mes = set(), set(), None, False
         self._last_question_years = years
         self._last_question_months = months
         self._last_question_recent = recent_period_keys

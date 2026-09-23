@@ -81,9 +81,17 @@ class _AskMixin(_ServiceBase):
                     # volume materializado pelo UNION ALL dos 16 grupos e o pico
                     # de memória (evita OOM), sem alterar o resultado.
                     cache_scope = self.cache.prepare_question_cache(question, request_id, sql=sql)
-                except RuntimeError as cache_err:
-                    # >>> NOVO: Se prepare_question_cache falhar, tenta preparar com todos os arquivos <<<
-                    LOGGER.warning("prepare_question_cache falhou: %s. Tentando com todos os períodos.", cache_err)
+                except (RuntimeError, ValueError) as cache_err:
+                    # >>> CORRECAO (pergunta SEM periodo): captura ValueError tambem. <<<
+                    # Antes, prepare_question_cache -> select_groups_periods_for_question
+                    # -> _parse_periods levantava ValueError("Informe a pergunta um
+                    # ano, mes...") para perguntas SEM periodo (ex.: "cids M05,M06,M10").
+                    # Como aqui so havia `except RuntimeError`, a excecao ESCAPAVA e
+                    # derrubava a requisicao com HTTP 500 -- MESMO com CIDs VALIDOS.
+                    # Agora capturamos ValueError e caímos no fallback de "todos os
+                    # periodos disponiveis", deixando a consulta rodar.
+                    LOGGER.warning("prepare_question_cache falhou (%s): %s. Tentando com todos os períodos.",
+                                   type(cache_err).__name__, cache_err)
                     all_periods = {(year, month) for _, year, month in self.cache._indexed_parquet_records()}
                     if not all_periods:
                         raise RuntimeError("Não há dados de períodos disponíveis no cache para preparar a consulta.")

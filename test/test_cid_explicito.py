@@ -239,6 +239,89 @@ def test_bypass_deterministico() -> int:
     return falhas
 
 
+# ======================================================================
+# FASE 5.4 — BUG: filtro CID como ``IN ('M05%', 'M06%', 'M10%')``
+# ======================================================================
+# Regressao do bug "qual a evolucao dos casos de CID M05,M06,M10 ... nao
+# retorna dados": o LLM gerava ``... IN ('M05%', ...)`` (igualdade EXATA
+# contra strings com o coringa dentro), que nao casa nenhum codigo real.
+def test_normalize_cid_in_filters() -> int:
+    svc = _svc()
+    falhas = 0
+    print("-- normalizacao do filtro CID em IN(...) --")
+
+    # (sql_entrada, deve_conter, nao_deve_conter)
+    casos = [
+        (
+            'SELECT atend_ano, COUNT(*) FROM datasus_query_cache WHERE '
+            'UPPER(TRIM(CAST("CIDPRI" AS VARCHAR))) IN (\'M05%\', \'M06%\', \'M10%\') '
+            'GROUP BY 1',
+            ["LIKE 'M05%'", "LIKE 'M06%'", "LIKE 'M10%'"],
+            [" IN ("],
+        ),
+        (
+            'SELECT 1 FROM datasus_query_cache WHERE "CIDPRI" IN (\'A90%\', \'B05%\')',
+            ["LIKE 'A90%'", "LIKE 'B05%'"],
+            [" IN ("],
+        ),
+    ]
+    for sql, deve_conter, nao_deve in casos:
+        out = svc._normalize_cid_in_filters(sql, "test-in")
+        ok = all(t in out for t in deve_conter) and all(t not in out for t in nao_deve)
+        if not ok:
+            falhas += 1
+        print(f"[{'OK ' if ok else 'FALHA'}] {sql[:60]!r} -> {out[:120]!r}")
+
+    # Nao deve mexer em LIKE ja correto nem em IN que nao e de CID.
+    sql_ok = 'SELECT 1 FROM datasus_query_cache WHERE "C" LIKE \'M05%\''
+    if svc._normalize_cid_in_filters(sql_ok, "t") == sql_ok:
+        print("[OK ] LIKE ja correto permanece intacto")
+    else:
+        falhas += 1
+        print("[FALHA] LIKE ja correto foi alterado")
+
+    sql_nc = "SELECT 1 FROM datasus_query_cache WHERE col IN (\'foo\', \'bar\')"
+    if svc._normalize_cid_in_filters(sql_nc, "t") == sql_nc:
+        print("[OK ] IN nao-CID permanece intacto")
+    else:
+        falhas += 1
+        print("[FALHA] IN nao-CID foi alterado")
+
+    return falhas
+
+
+def test_validacao_a1_in() -> int:
+    svc = _svc()
+    falhas = 0
+    print("-- validacao A1 reconhece CID em IN(...) --")
+
+    sql = (
+        'SELECT atend_ano AS ano, COUNT(*) AS casos FROM datasus_query_cache WHERE '
+        'UPPER(TRIM(CAST("CIDPRI" AS VARCHAR))) IN (\'M05%\', \'M06%\', \'M10%\') GROUP BY 1'
+    )
+    pergunta = "qual a evolucao dos casos de CID M05,M06,M10 nos ultimos 3 anos, agrupe por ano"
+    invalidos = svc._validate_cid_filters(sql, "t-in", question=pergunta)
+    if invalidos == []:
+        print("[OK ] IN alinhado ao CID do usuario nao gera divergencia")
+    else:
+        falhas += 1
+        print(f"[FALHA] divergencia inesperada: {invalidos}")
+
+    # IN com CID a mais -> deve detectar a divergencia (A1).
+    sql_extra = (
+        'SELECT 1 FROM datasus_query_cache WHERE UPPER(TRIM(CAST("C" AS VARCHAR))) '
+        'IN (\'M05%\', \'M06%\', \'C99%\')'
+    )
+    div = sorted(svc._validate_cid_filters(sql_extra, "t-in", question="casos de M05, M06"))
+    if div == ["C99"]:
+        print("[OK ] IN com CID extra detectado: ['C99']")
+    else:
+        falhas += 1
+        print(f"[FALHA] esperava ['C99'], obteve {div}")
+
+    return falhas
+
+
 def main() -> int:
     print("=" * 64)
     print("FASE 5.1 - extracao de CID explicito (unico e listas) + periodo")
@@ -254,6 +337,11 @@ def main() -> int:
     print("=" * 64)
     f += test_grounding_bloco()
     f += test_bypass_deterministico()
+    print("=" * 64)
+    print("FASE 5.4 - bug filtro CID em IN(...)")
+    print("=" * 64)
+    f += test_normalize_cid_in_filters()
+    f += test_validacao_a1_in()
     print(f"\n=== {f} falha(s) ===")
     return 1 if f else 0
 
