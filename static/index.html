@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DATASUS LLM</title>
+  <title>DataSUS Explorer</title>
   <style>
     :root { color-scheme: light; font-family: Georgia, serif; color: #173b3f; background: #f4efe6; }
     body { max-width: 920px; margin: 0 auto; padding: 48px 22px; }
@@ -34,8 +34,8 @@
   </style>
 </head>
 <body>
-  <h1> PoC - DATASUS <br>LLM</h1>
-  <p class="lead">Faça uma pergunta sobre os diagnosticos mapeados pelo DataSUS. O sistema consulta o cache DuckDB e usa um LLM para transformar a pergunta em uma consulta estatística auditável.</p>
+  <h1> PoC - DataSUS Explorer </h1>
+  <p class="lead">Faça uma pergunta sobre os diagnosticos mapeados pelo DataSUS. O sistema consulta os dados em cache do DataSUS e utiliza IA para transformar a pergunta em uma consulta estatística auditável.</p>
   <form id="ask-form">
     <textarea id="question" required placeholder="Ex.: Quantos registros existem por ano para dengue?"></textarea>
     <fieldset class="chart-selector">

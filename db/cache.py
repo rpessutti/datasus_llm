@@ -22,6 +22,7 @@ from config.settings import PROJECT_DIR, DATASUS_DATA_DIR
 from config.constants import DIAGNOSIS_COLUMN_NAMES, DEFAULT_FETCH_ROWS, FILE_METADATA_COLUMNS
 from core.io_utils import _discover_files_in, _retry_copyfile, _retry_stat, _sync_to_official_cache
 from core.logging_config import log_calls
+from core.duckdb_config import apply_duckdb_experimental_settings
 from core.path_utils import _grouped_cache_path, _schema_rows, _migrate_legacy_cache_paths, _extract_period_from_path
 from db.group_cache import _GroupCache
 from db.column_dictionary import ColumnDictionaryStore, persist_to_duckdb
@@ -298,6 +299,13 @@ class DatasusCache:
                 pass
         except Exception as e:
             LOGGER.warning("erro ao configurar memória do DuckDB: %s", e)
+        finally:
+            # >>> VSS/HNSW: habilita a persistencia EXPERIMENTAL dos indices HNSW <<<
+            # Precisa ser aplicado ANTES de gerar/ler caches que usam indices
+            # HNSW em bancos persistentes (.duckdb). Sem a flag, a criacao/
+            # leitura de indices HNSW persistentes falha no DuckDB. Best-effort:
+            # nao interrompe a inicializacao (ver core/duckdb_config.py).
+            apply_duckdb_experimental_settings(self.connection, label="datasus")
 
     @staticmethod
     def _referenced_columns(sql: str, available: set[str]) -> set[str]:

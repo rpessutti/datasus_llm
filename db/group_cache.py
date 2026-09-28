@@ -12,7 +12,9 @@ import duckdb
 from config.settings import PROJECT_DIR
 from core.io_utils import _discover_files_in, _retry_copyfile, _retry_stat
 from core.logging_config import log_calls
+from core.duckdb_config import apply_duckdb_experimental_settings
 from core.path_utils import _grouped_cache_path, _schema_rows, _file_period, _extract_period_from_path
+from db.column_comments import apply_comments as _apply_column_comments_to
 from db.period_fields import (
     PERIOD_FIELDS,
     ATEND_ANO,
@@ -149,6 +151,10 @@ class _GroupCache:
                 f"CREATE TABLE IF NOT EXISTS {ckpt_table} ("
                 "key VARCHAR PRIMARY KEY, value VARCHAR)"
             )
+            # Metadados: aplica descrição/exemplos do layout CSV como COMENTÁRIO
+            # das colunas da TABELA datasus_cache (só para campos que coincidem
+            # EXATAMENTE). Idempotente e best-effort; nunca toca na VIEW datasus.
+            self._apply_column_comments()
         except Exception:
             # >>> CORREÇÃO: NÃO descarta o grupo para ':memory:' quando há conexão
             # principal. O fallback em memória isola o grupo, fazendo as consultas
@@ -413,8 +419,8 @@ class _GroupCache:
         # Configuração centralizada em config/settings.py (sugestão 5)
         # Usa os MESMOS defaults de Settings para manter consistência entre o
         # cache principal (DatasusCache) e os bancos dos grupos (_GroupCache).
-        memory_limit = os.getenv("DATASUS_MEMORY_LIMIT", "1GB")
-        threads = int(os.getenv("DATASUS_THREADS", "4"))
+        memory_limit = os.getenv("DATASUS_MEMORY_LIMIT", "8GB")
+        threads = int(os.getenv("DATASUS_THREADS", "8"))
         # Spill dir resiliente: se DATASUS_TEMP_DIR for definido, usa-o;
         # senão fallback para o cache do grupo (ou ./cache em caso de USB removível).
         temp_dir_raw = os.getenv("DATASUS_TEMP_DIR", "")
@@ -434,12 +440,23 @@ class _GroupCache:
             # (isso seria aplicado à conexão principal e pode causar conflitos).
             if self._using_main_connection:
                 LOGGER.info("grupo %s: usando conexão principal; PRAGMAs de memória já configurados", self.name)
+                # A persistência experimental de HNSW já terá sido aplicada na
+                # conexão principal (DatasusCache._configure_memory). Ainda assim
+                # reaplicamos por segurança/idempotência — é barato e garante a
+                # flag antes de qualquer leitura/gravação de cache deste grupo.
+                apply_duckdb_experimental_settings(self.connection, label=f"grupo {self.name}")
                 return
             self.connection.execute(f"PRAGMA temp_directory='{temp_dir}'")
             self.connection.execute(f"PRAGMA memory_limit='{memory_limit}'")
             self.connection.execute(f"PRAGMA threads={threads}")
         except Exception:
             LOGGER.exception("grupo %s: não foi possível aplicar limites de memória", self.name)
+        finally:
+            # >>> VSS/HNSW: habilita a persistencia EXPERIMENTAL dos indices HNSW <<<
+            # Aplicado ANTES da geracao/leitura de caches com indices HNSW em
+            # bancos persistentes (.duckdb). Best-effort (ver core/duckdb_config.py).
+            if self.connection is not None:
+                apply_duckdb_experimental_settings(self.connection, label=f"grupo {self.name}")
 
     def _scalar(self, sql: str, params: list[Any] | None = None, default: Any = None) -> Any:
         if self.connection is None:
@@ -1306,8 +1323,36 @@ class _GroupCache:
         # Garante que nenhuma linha ficou sem período (evita o sintoma de
         # "resultado vazio" em consultas com filtro temporal).
         self._verify_period_integrity()
+        # Reaplica os comentários de coluna (descrição/exemplos do layout) na
+        # TABELA datasus_cache, caso ela tenha sido (re)criada/alterada.
+        self._apply_column_comments()
         if cached:
             self._refresh_period_index(cached)
+
+    def _apply_column_comments(self) -> int:
+        """Aplica descrição/exemplos do layout CSV como comentário nas colunas.
+
+        Lê ``<cache_dir>/layout_csv/<grupo>.csv`` e grava a descrição (e os
+        exemplos, quando existirem) como COMENTÁRIO das colunas da TABELA
+        ``datasus_cache``. Só comenta quando o campo do CSV coincide EXATAMENTE
+        com uma coluna existente. A VIEW ``datasus`` NÃO é comentada.
+
+        Idempotente e best-effort: nunca levanta exceção (falhas são logadas).
+        Não faz nada em modo VIEW (S1), pois não há tabela física para comentar.
+        """
+        try:
+            if not self._cache_table_exists():
+                return 0
+            return _apply_column_comments_to(
+                self.connection,
+                self.cache_dir,
+                self.name,
+                table="datasus_cache",
+                qualified=self._using_main_connection,
+            )
+        except Exception:
+            LOGGER.exception("grupo %s: falha ao aplicar comentários de colunas", self.name)
+            return 0
 
     def _cached_group_files(self) -> list[Path]:
         return _discover_files_in(self.cache_dir / self.name)
