@@ -220,7 +220,7 @@ python -m py_compile db\group_cache.py db\cache.py dev_tools\rebuild_group_cache
 | F0 Inventário | ✅ | `inventario.txt` (métodos/docstrings/mojibake) |
 | F1 Backups integrais | ✅ | `_backups/cache_duplicado_20261012_113100/` + `SHA256SUMS.txt` |
 | F2 Ferramenta de reparo | ✅ | `dev_tools/repair_group_cache_duplication.py` (`--dry-run/--apply/--apply-por-ano/--rewrite/--rebuild`) |
-| F3 Reparo dos dados | ✅ 10 de 15 grupos | `--apply` em `er, acf, rj, ar, amp, atd, ps, rd, aq, am`; `sp` (1,26 bi de linhas) via `--apply-por-ano`; `bi`/`pa`/`ab`/`abo` pendentes (espaço / sem banco) |
+| F3 Reparo dos dados | ✅ 11 de 15 grupos | `--apply` em `er, acf, rj, ar, amp, atd, ps, rd, aq, am`; `sp` via `--apply-por-ano` (6 fatias de ano); `bi`/`pa` pendentes (espaço) e `ab`/`abo` sem banco |
 | F4 Blindagem da ingestão | ✅ | `import_batch` e `ingest`: `DELETE FROM <cache_table> WHERE parquet_path IN (SELECT DISTINCT parquet_path FROM temp_batch)` antes do INSERT |
 | F5 Rebuild (fallback) | ✅ | `CACHE_DIR = setting.cache_dir` (antes `<projeto>/cache`, vazio) + docstrings |
 | F6 Docstrings | ✅ L1+L2 | `db/group_cache.py` 10, `db/cache.py` 24, `rebuild_group_cache.py` 3, ferramenta nova 100% |
@@ -241,7 +241,11 @@ python -m py_compile db\group_cache.py db\cache.py dev_tools\rebuild_group_cache
 | `rd` | 21.320.534 | 10.660.267 | 648 → 324 | 1,000 | 2.250,5 → 2.400,7 MiB |
 | `aq` | 56.315.370 | 28.157.685 | 4.180 → 2.090 | 1,000 | 5.613,6 → 3.567,8 MiB |
 | `am` | 263.666.606 | 131.833.303 | 3.865 → 1.949 | 1,000 | 14.199 → 8.002,7 MiB |
-| `sp` | 1.257.474.998 | (em execução) | 2.200 → 1.100 | — | 47.294 MiB → — |
+| `sp` | 1.257.474.998 | 628.737.499 | 2.200 → 1.100 | 1,000 | 47.294,5 → 47.296,0 MB (blocos livres) |
+
+`sp` foi reparado por fatias de ano (`--apply-por-ano`), removendo
+2021: 108.694.768 · 2022: 103.754.304 · 2023: 123.891.175 · 2024: 125.693.043 ·
+2025: 147.766.618 · 2026: 18.937.591 linhas (total 628.737.499 = metade da tabela).
 
 Em todos: `parquet_path` distintos = nº de Parquet, `file_manifest` sem órfãos e **nenhum Parquet criado/removido**.
 
