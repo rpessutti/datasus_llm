@@ -1,6 +1,6 @@
 # PLANO — Reparo do cache de grupos duplicado (2×) + documentação de métodos
 
-> **Status:** EM EXECUÇÃO. Escrito em 2026-10-12 (branch `2026-10-12`).
+> **Status:** EM EXECUÇÃO — 12 de 15 grupos reparados em 2026-10-12 (resta `pa`; ver §8.3). Escrito em 2026-10-12 (branch `2026-10-12`).
 > **Objetivo:** eliminar a duplicação **real** (2×) de linhas em `<grupo>.datasus_cache`
 > e de entradas em `<grupo>.file_manifest`, **preservando integralmente os Parquet**
 > (que são o cache real) e **sem reprocessar dados** desnecessariamente, além de
@@ -220,12 +220,12 @@ python -m py_compile db\group_cache.py db\cache.py dev_tools\rebuild_group_cache
 | F0 Inventário | ✅ | `inventario.txt` (métodos/docstrings/mojibake) |
 | F1 Backups integrais | ✅ | `_backups/cache_duplicado_20261012_113100/` + `SHA256SUMS.txt` |
 | F2 Ferramenta de reparo | ✅ | `dev_tools/repair_group_cache_duplication.py` (`--dry-run/--apply/--apply-por-ano/--rewrite/--rebuild`) |
-| F3 Reparo dos dados | ✅ 11 de 15 grupos | `--apply` em `er, acf, rj, ar, amp, atd, ps, rd, aq, am`; `sp` via `--apply-por-ano` (6 fatias de ano); `bi`/`pa` pendentes (espaço) e `ab`/`abo` sem banco |
+| F3 Reparo dos dados | ✅ 12 de 15 grupos | `--apply` em `er, acf, rj, ar, amp, atd, ps, rd, aq, am`; `sp` (6 fatias de ano) e `bi` (7 fatias) via `--apply-por-ano`; `pa` pendente (espaço) e `ab`/`abo` sem banco |
 | F4 Blindagem da ingestão | ✅ | `import_batch` e `ingest`: `DELETE FROM <cache_table> WHERE parquet_path IN (SELECT DISTINCT parquet_path FROM temp_batch)` antes do INSERT |
 | F5 Rebuild (fallback) | ✅ | `CACHE_DIR = setting.cache_dir` (antes `<projeto>/cache`, vazio) + docstrings |
 | F6 Docstrings | ✅ L1+L2 | `db/group_cache.py` 10, `db/cache.py` 24, `rebuild_group_cache.py` 3, ferramenta nova 100% |
 | F7 Testes | ✅ (parcial) | `test/test_repair_group_cache.py` (7 testes) + 42 testes focados de ingestão/views verdes |
-| F8 Fechamento | ⏳ | docs + commit |
+| F8 Fechamento | ✅ | docs atualizados + commits `ee14665`/`ea1f7fd`/`7e2a71d` + reparo `bi` (`--apply-por-ano`) |
 
 ### 8.1 Resultado do reparo (medido, `--apply`)
 
@@ -242,6 +242,7 @@ python -m py_compile db\group_cache.py db\cache.py dev_tools\rebuild_group_cache
 | `aq` | 56.315.370 | 28.157.685 | 4.180 → 2.090 | 1,000 | 5.613,6 → 3.567,8 MiB |
 | `am` | 263.666.606 | 131.833.303 | 3.865 → 1.949 | 1,000 | 14.199 → 8.002,7 MiB |
 | `sp` | 1.257.474.998 | 628.737.499 | 2.200 → 1.100 | 1,000 | 47.294,5 → 47.296,0 MB (blocos livres) |
+| `bi` | 1.858.437.834 | 929.218.917 | 2.422 → 1.211 | 1,000 | 88.626,4 → 88.626,4 MB (blocos livres; `--rewrite` pendente) |
 
 `sp` foi reparado por fatias de ano (`--apply-por-ano`), removendo
 2021: 108.694.768 · 2022: 103.754.304 · 2023: 123.891.175 · 2024: 125.693.043 ·
@@ -260,9 +261,10 @@ Em todos: `parquet_path` distintos = nº de Parquet, `file_manifest` sem órfão
    (`--rewrite`, `COPY FROM DATABASE` + troca com backup `.bak_<ts>` + validação),
    que exige espaço livre ≈ blocos usados do grupo.
 3. **Restrição de disco:** `D:` tinha **12,2 GB livres** no início. Por isso:
-   `sp` foi liberado após o `am` (ficou ~19,7 GB), mas **`bi` (≈44 GB) e `pa`
-   (≈74 GB) NÃO cabem** no espaço livre atual — ficam pendentes de mais espaço
-   (ou de reescrita em outro volume) antes de `--apply`/`--rewrite`.
+   `sp` foi liberado após o `am` (ficou ~19,7 GB). Em 2026-10-12 o **`bi`** foi
+   reparado com **`--apply-por-ano`** (7 fatias de ano; o `DELETE` roda *dentro*
+   do arquivo e não exige espaço extra — só o `--rewrite` exige ~59 GB). O
+   **`pa`** segue pendente de espaço livre antes de `--apply`/`--rewrite`.
    Em `sp` (1,26 bi de linhas) o `--apply` simples foi interrompido no meio; o
    estado ficou consistente (manifesto já limpo, tabela intacta com 2×) e o
    reparo foi refeito com **`--apply-por-ano`**, que fati­a por `parquet_year`
@@ -277,8 +279,11 @@ Em todos: `parquet_path` distintos = nº de Parquet, `file_manifest` sem órfão
 
 ### 8.3 Pendências explícitas
 
-* `bi` e `pa`: `--apply` + `--rewrite` quando houver espaço livre
-  (≈44 GB e ≈74 GB, +15% de margem).
+* `bi`: **`--apply` concluído em 2026-10-12** (razão 1,000; −929.218.917 linhas,
+  manifesto 2.422 → 1.211, 0 órfãos). Resta **`--rewrite`** para devolver os
+  ~37 GB de blocos livres — exige ≈51,4 GB × 1,15 ≈ **59 GB** livres em `D:` e
+  hoje há ~46–50 GB.
+* `pa`: `--apply` + `--rewrite` quando houver espaço livre (≈74 GB, +15% de margem).
 * `--rewrite` nos grupos já reparados: opcional, para devolver os blocos livres
   (ex.: `python dev_tools/repair_group_cache_duplication.py --rewrite acf ar atd`).
 * S1 (`DATASUS_CACHE_AS_VIEW=true`): exige ajustar `groups_needing_ingest()` para
