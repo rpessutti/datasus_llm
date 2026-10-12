@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import os
@@ -12,7 +12,6 @@ import duckdb
 from config.settings import PROJECT_DIR
 from core.io_utils import _discover_files_in, _retry_copyfile, _retry_stat
 from core.logging_config import log_calls
-from core.duckdb_config import apply_duckdb_experimental_settings
 from core.path_utils import _grouped_cache_path, _schema_rows, _file_period, _extract_period_from_path
 from db.column_comments import apply_comments as _apply_column_comments_to
 from db.period_fields import (
@@ -47,12 +46,12 @@ LOGGER = logging.getLogger("datasus_llm")
 class _GroupCache:
     """Cache DuckDB dedicado a uma sub-pasta dos dados (ex.: sp, rj, am, ...).
 
-    Cada sub-pasta dentro de DATASUS_DATA_DIR recebe o seu próprio arquivo
-    '<subpasta>.duckdb' em DATASUS_CACHE_DIR, permitindo leituras rápidas e
+    Cada sub-pasta dentro de DATASUS_DATA_DIR recebe o seu prÃ³prio arquivo
+    '<subpasta>.duckdb' em DATASUS_CACHE_DIR, permitindo leituras rÃ¡pidas e
 
-    IMPORTANTE: a conexão DuckDB NÃO é aberta no construtor. Ela é aberta
-    sob demanda pelo método `reopen()`, permitindo que apenas um arquivo
-    .duckdb fique aberto em memória por vez durante a ingestão. Isso
+    IMPORTANTE: a conexÃ£o DuckDB NÃƒO Ã© aberta no construtor. Ela Ã© aberta
+    sob demanda pelo mÃ©todo `reopen()`, permitindo que apenas um arquivo
+    .duckdb fique aberto em memÃ³ria por vez durante a ingestÃ£o. Isso
     reduz drasticamente o uso de RAM.
     """
 
@@ -63,62 +62,62 @@ class _GroupCache:
         self.db_path = cache_dir / f"{name}.duckdb"
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.main_connection = main_connection
-        # A conexão será aberta sob demanda quando o grupo for processado
+        # A conexÃ£o serÃ¡ aberta sob demanda quando o grupo for processado
         self.connection = None
         self._using_main_connection = False
         LOGGER.info("grupo cache registrado name=%s db_path=%s (abertura sob demanda)", name, self.db_path)
 
     def close(self) -> None:
-        """Fecha a conexão DuckDB deste grupo, liberando memória.
+        """Fecha a conexÃ£o DuckDB deste grupo, liberando memÃ³ria.
 
-        Deve ser chamado após o processamento do grupo para que o próximo
-        grupo possa usar a memória liberada.
+        Deve ser chamado apÃ³s o processamento do grupo para que o prÃ³ximo
+        grupo possa usar a memÃ³ria liberada.
         """
         try:
             if self.connection is not None and not self._using_main_connection:
                 self.connection.close()
-                LOGGER.info("grupo %s: conexão DuckDB fechada, memória liberada", self.name)
+                LOGGER.info("grupo %s: conexÃ£o DuckDB fechada, memÃ³ria liberada", self.name)
             elif self._using_main_connection:
-                LOGGER.info("grupo %s: usando conexão principal; não será fechada aqui", self.name)
+                LOGGER.info("grupo %s: usando conexÃ£o principal; nÃ£o serÃ¡ fechada aqui", self.name)
         except Exception:
-            LOGGER.exception("grupo %s: erro ao fechar conexão DuckDB", self.name)
+            LOGGER.exception("grupo %s: erro ao fechar conexÃ£o DuckDB", self.name)
         finally:
             self.connection = None
             self._using_main_connection = False
 
     def reopen(self) -> None:
-        """Reabre a conexão DuckDB do grupo caso tenha sido fechada anteriormente.
+        """Reabre a conexÃ£o DuckDB do grupo caso tenha sido fechada anteriormente.
 
-        SEMPRE usa a conexão principal com o schema do grupo, pois os bancos
-        .duckdb dos grupos são anexados como schemas na conexão principal.
+        SEMPRE usa a conexÃ£o principal com o schema do grupo, pois os bancos
+        .duckdb dos grupos sÃ£o anexados como schemas na conexÃ£o principal.
         """
         if self.connection is not None:
             return
         try:
             if self.main_connection is not None:
-                # >>> CORREÇÃO: ANTES de usar a conexão principal, GARANTE que o banco
+                # >>> CORREÃ‡ÃƒO: ANTES de usar a conexÃ£o principal, GARANTE que o banco
                 # do grupo esteja ANEXADO como schema (ex.: 'pa'). Sem isso, quando o
-                # <grupo>.duckdb ainda não existia em disco, o ATTACH feito no
+                # <grupo>.duckdb ainda nÃ£o existia em disco, o ATTACH feito no
                 # DatasusCache.__init__ era pulado e toda query qualificada
                 # (ex.: SELECT ... FROM pa.file_manifest) falhava com
                 # "Catalog Error: Table with name file_manifest does not exist!".
                 #
-                # >>> CORREÇÃO (Catalog Error: Schema with name sp does not exist!):
+                # >>> CORREÃ‡ÃƒO (Catalog Error: Schema with name sp does not exist!):
                 # O flag DEVE ser marcado como True ANTES de chamar _ensure_attached(),
                 # pois _ensure_attached() tem a guarda
                 #   `if not self._using_main_connection ...: return`
-                # Na ordem anterior (ensure_attached -> set flag) o método retornava
+                # Na ordem anterior (ensure_attached -> set flag) o mÃ©todo retornava
                 # cedo, o ATTACH do <grupo>.duckdb nunca acontecia, e a linha seguinte
                 # (CREATE TABLE IF NOT EXISTS sp.file_manifest) falhava com
                 # "Catalog Error: Schema with name sp does not exist!".
                 self.connection = self.main_connection
                 self._using_main_connection = True
                 self._ensure_attached()
-                LOGGER.info("grupo %s: usando conexão principal (schema %s)", self.name, self.name)
+                LOGGER.info("grupo %s: usando conexÃ£o principal (schema %s)", self.name, self.name)
             else:
                 self.connection = duckdb.connect(str(self.db_path))
             self._configure_memory()
-            # Garante as tabelas básicas e migrações necessárias
+            # Garante as tabelas bÃ¡sicas e migraÃ§Ãµes necessÃ¡rias
             manifest_table = f"file_manifest" if not self._using_main_connection else f"{self.name}.file_manifest"
             metadata_table = f"metadata" if not self._using_main_connection else f"{self.name}.metadata"
             period_table = f"period_index" if not self._using_main_connection else f"{self.name}.period_index"
@@ -128,7 +127,7 @@ class _GroupCache:
                 "(source VARCHAR PRIMARY KEY, size BIGINT, modified DOUBLE, cached VARCHAR, "
                 "in_db INTEGER DEFAULT 0, invalid INTEGER DEFAULT 0)"
             )
-            # Migração: adiciona a coluna 'invalid' caso a tabela já exista sem ela.
+            # MigraÃ§Ã£o: adiciona a coluna 'invalid' caso a tabela jÃ¡ exista sem ela.
             manifest_cols = {row[0] for row in self.connection.execute(f"DESCRIBE {manifest_table}").fetchall()}
             if "invalid" not in manifest_cols:
                 LOGGER.info("grupo %s: migrando file_manifest para incluir coluna 'invalid'", self.name)
@@ -136,7 +135,7 @@ class _GroupCache:
             # >>> FASE 3 (#3): MIGRACAO IDEMPOTENTE das colunas de periodo FISICAS <<<
             # Materializa atend_ano/atend_mes na tabela datasus_cache (quando ela
             # for TABELA fisica), derivadas do CAMPO NATIVO de periodo do grupo
-            # (SP_DTINTER, DT_INTER, DT_ATEND, PA_CMP, AP_DTINIC — ver
+            # (SP_DTINTER, DT_INTER, DT_ATEND, PA_CMP, AP_DTINIC â€” ver
             # db/period_fields.py). Isso permite que o UNION de prepare_question_cache
             # use as colunas fisicas (push-down) em vez de SUBSTR(CAST(...)) a cada
             # consulta. Idempotente: so adiciona colunas que faltam; nunca apaga dados.
@@ -146,48 +145,48 @@ class _GroupCache:
                 f"CREATE TABLE IF NOT EXISTS {period_table} "
                 "(path VARCHAR PRIMARY KEY, parquet_year VARCHAR, parquet_month VARCHAR)"
             )
-            # Tabela de checkpoint para retomar ingestão interrompida
+            # Tabela de checkpoint para retomar ingestÃ£o interrompida
             self.connection.execute(
                 f"CREATE TABLE IF NOT EXISTS {ckpt_table} ("
                 "key VARCHAR PRIMARY KEY, value VARCHAR)"
             )
-            # Metadados: aplica descrição/exemplos do layout CSV como COMENTÁRIO
-            # das colunas da TABELA datasus_cache (só para campos que coincidem
+            # Metadados: aplica descriÃ§Ã£o/exemplos do layout CSV como COMENTÃRIO
+            # das colunas da TABELA datasus_cache (sÃ³ para campos que coincidem
             # EXATAMENTE). Idempotente e best-effort; nunca toca na VIEW datasus.
             self._apply_column_comments()
         except Exception:
-            # >>> CORREÇÃO: NÃO descarta o grupo para ':memory:' quando há conexão
-            # principal. O fallback em memória isola o grupo, fazendo as consultas
+            # >>> CORREÃ‡ÃƒO: NÃƒO descarta o grupo para ':memory:' quando hÃ¡ conexÃ£o
+            # principal. O fallback em memÃ³ria isola o grupo, fazendo as consultas
             # qualificadas (schema.<tabela>) continuarem falhando e, pior, ocultando
-            # a falha real de ATTACH. Só cai para memória no modo sem conexão principal.
+            # a falha real de ATTACH. SÃ³ cai para memÃ³ria no modo sem conexÃ£o principal.
             if self.main_connection is not None:
                 LOGGER.error(
                     "grupo %s: falha ao preparar schema do grupo em %s; propagando erro "
-                    "(conexão principal presente)",
+                    "(conexÃ£o principal presente)",
                     self.name, self.db_path, exc_info=True,
                 )
                 raise
-            LOGGER.error("falha ao reabrir DuckDB do grupo %s em %s; usando banco em memória",
+            LOGGER.error("falha ao reabrir DuckDB do grupo %s em %s; usando banco em memÃ³ria",
                          self.name, self.db_path, exc_info=True)
             self.db_path = None
             self._using_main_connection = False
             self.connection = duckdb.connect(":memory:")
             self._configure_memory()
-        LOGGER.info("grupo %s: conexão DuckDB reaberta com tabelas garantidas", self.name)
+        LOGGER.info("grupo %s: conexÃ£o DuckDB reaberta com tabelas garantidas", self.name)
 
     def _ensure_attached(self) -> None:
-        """Garante que o banco .duckdb do grupo esteja ANEXADO como schema na conexão principal.
+        """Garante que o banco .duckdb do grupo esteja ANEXADO como schema na conexÃ£o principal.
 
-        Cria o arquivo do banco caso ele ainda não exista e realiza o ATTACH
-        (READ_WRITE, com fallback para READ_ONLY). Operação idempotente: se o
-        schema já estiver anexado, não faz nada.
+        Cria o arquivo do banco caso ele ainda nÃ£o exista e realiza o ATTACH
+        (READ_WRITE, com fallback para READ_ONLY). OperaÃ§Ã£o idempotente: se o
+        schema jÃ¡ estiver anexado, nÃ£o faz nada.
 
-        IMPORTANTE: este método NUNCA apaga arquivos .duckdb — apenas cria e
-        anexa. É seguro chamá-lo repetidamente.
+        IMPORTANTE: este mÃ©todo NUNCA apaga arquivos .duckdb â€” apenas cria e
+        anexa. Ã‰ seguro chamÃ¡-lo repetidamente.
         """
-        # >>> CORREÇÃO: depende apenas de haver conexão principal, não do flag
-        # _using_main_connection. Assim o ATTACH é garantido mesmo quando este
-        # método é chamado em qualquer ordem relativa à marcação do flag (ver
+        # >>> CORREÃ‡ÃƒO: depende apenas de haver conexÃ£o principal, nÃ£o do flag
+        # _using_main_connection. Assim o ATTACH Ã© garantido mesmo quando este
+        # mÃ©todo Ã© chamado em qualquer ordem relativa Ã  marcaÃ§Ã£o do flag (ver
         # reopen()), evitando o erro
         # "Catalog Error: Schema with name <grupo> does not exist!".
         if self.main_connection is None:
@@ -201,11 +200,11 @@ class _GroupCache:
             if exists:
                 return
 
-            # Garante que o diretório exista. NÃO abrimos uma conexão temporária
-            # só para materializar o arquivo: isso adquire um lock momentâneo
-            # sobre <grupo>.duckdb que pode colidir com a conexão principal
+            # Garante que o diretÃ³rio exista. NÃƒO abrimos uma conexÃ£o temporÃ¡ria
+            # sÃ³ para materializar o arquivo: isso adquire um lock momentÃ¢neo
+            # sobre <grupo>.duckdb que pode colidir com a conexÃ£o principal
             # (IOException: Could not set lock on file ...). O ATTACH abaixo cria
-            # o arquivo se ele ainda não existir.
+            # o arquivo se ele ainda nÃ£o existir.
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 self.main_connection.execute(
@@ -220,12 +219,12 @@ class _GroupCache:
                 self.name, self.db_path, safe_name,
             )
         except duckdb.IOException as exc:
-            # Fix 4: erro de lock é diagnosticado explicitamente.
+            # Fix 4: erro de lock Ã© diagnosticado explicitamente.
             if "Could not set lock" in str(exc):
                 LOGGER.error(
-                    "grupo %s: arquivo %s está BLOQUEADO por OUTRO processo "
-                    "(conflicting lock). Verifique com `lsof %s` / `fuser -v %s` se há "
-                    "execução anterior ativa (app, notebook ou rebuild_group_cache.py) "
+                    "grupo %s: arquivo %s estÃ¡ BLOQUEADO por OUTRO processo "
+                    "(conflicting lock). Verifique com `lsof %s` / `fuser -v %s` se hÃ¡ "
+                    "execuÃ§Ã£o anterior ativa (app, notebook ou rebuild_group_cache.py) "
                     "e encerre-a antes de reexecutar.",
                     self.name, self.db_path, self.db_path, self.db_path,
                 )
@@ -249,7 +248,7 @@ class _GroupCache:
         Caso contrario retorna ``None`` (o chamador usa o caminho padrao).
 
         Isso garante que os LOTES INCREMENTAIS gravem atend_ano/atend_mes
-        preenchidos (nunca CAST(NULL)) — o mesmo bug que ocorria com
+        preenchidos (nunca CAST(NULL)) â€” o mesmo bug que ocorria com
         parquet_year/parquet_month em lotes incrementais.
         """
         pf = PERIOD_FIELDS.get(self.name)
@@ -416,13 +415,13 @@ class _GroupCache:
             )
 
     def _configure_memory(self) -> None:
-        # Configuração centralizada em config/settings.py (sugestão 5)
-        # Usa os MESMOS defaults de Settings para manter consistência entre o
+        # ConfiguraÃ§Ã£o centralizada em config/settings.py (sugestÃ£o 5)
+        # Usa os MESMOS defaults de Settings para manter consistÃªncia entre o
         # cache principal (DatasusCache) e os bancos dos grupos (_GroupCache).
         memory_limit = os.getenv("DATASUS_MEMORY_LIMIT", "8GB")
         threads = int(os.getenv("DATASUS_THREADS", "8"))
         # Spill dir resiliente: se DATASUS_TEMP_DIR for definido, usa-o;
-        # senão fallback para o cache do grupo (ou ./cache em caso de USB removível).
+        # senÃ£o fallback para o cache do grupo (ou ./cache em caso de USB removÃ­vel).
         temp_dir_raw = os.getenv("DATASUS_TEMP_DIR", "")
         if temp_dir_raw:
             temp_dir = Path(temp_dir_raw)
@@ -436,36 +435,25 @@ class _GroupCache:
                 temp_dir = PROJECT_DIR / "cache" / "duckdb_spill"
                 temp_dir.mkdir(parents=True, exist_ok=True)
         try:
-            # Se estiver usando a conexão principal, não aplica PRAGMAs de memória
-            # (isso seria aplicado à conexão principal e pode causar conflitos).
+            # Se estiver usando a conexÃ£o principal, nÃ£o aplica PRAGMAs de memÃ³ria
+            # (isso seria aplicado Ã  conexÃ£o principal e pode causar conflitos).
             if self._using_main_connection:
-                LOGGER.info("grupo %s: usando conexão principal; PRAGMAs de memória já configurados", self.name)
-                # A persistência experimental de HNSW já terá sido aplicada na
-                # conexão principal (DatasusCache._configure_memory). Ainda assim
-                # reaplicamos por segurança/idempotência — é barato e garante a
-                # flag antes de qualquer leitura/gravação de cache deste grupo.
-                apply_duckdb_experimental_settings(self.connection, label=f"grupo {self.name}")
+                LOGGER.info("grupo %s: usando conexÃ£o principal; PRAGMAs de memÃ³ria jÃ¡ configurados", self.name)
                 return
             self.connection.execute(f"PRAGMA temp_directory='{temp_dir}'")
             self.connection.execute(f"PRAGMA memory_limit='{memory_limit}'")
             self.connection.execute(f"PRAGMA threads={threads}")
         except Exception:
-            LOGGER.exception("grupo %s: não foi possível aplicar limites de memória", self.name)
-        finally:
-            # >>> VSS/HNSW: habilita a persistencia EXPERIMENTAL dos indices HNSW <<<
-            # Aplicado ANTES da geracao/leitura de caches com indices HNSW em
-            # bancos persistentes (.duckdb). Best-effort (ver core/duckdb_config.py).
-            if self.connection is not None:
-                apply_duckdb_experimental_settings(self.connection, label=f"grupo {self.name}")
+            LOGGER.exception("grupo %s: nÃ£o foi possÃ­vel aplicar limites de memÃ³ria", self.name)
 
     def _scalar(self, sql: str, params: list[Any] | None = None, default: Any = None) -> Any:
         if self.connection is None:
-            LOGGER.warning("grupo %s: conexão não aberta ao chamar _scalar; abrindo", self.name)
+            LOGGER.warning("grupo %s: conexÃ£o nÃ£o aberta ao chamar _scalar; abrindo", self.name)
             self.reopen()
             if self.connection is None:
-                LOGGER.error("grupo %s: falha ao abrir conexão", self.name)
+                LOGGER.error("grupo %s: falha ao abrir conexÃ£o", self.name)
                 return default            
-        # Qualifica tabelas não-qualificadas quando usando a conexão principal
+        # Qualifica tabelas nÃ£o-qualificadas quando usando a conexÃ£o principal
         if self._using_main_connection:
             sql = self._qualify_sql(sql)
         LOGGER.debug("grupo %s: executando consulta: %s", self.name, sql)
@@ -526,7 +514,7 @@ class _GroupCache:
             try:
                 count = self.main_connection.execute(
                     "SELECT COUNT(*) FROM duckdb_tables() "
-                    "WHERE database_name = ? AND table_name = 'datasus_cache'",
+                    "WHERE LOWER(database_name) = LOWER(?) AND table_name = 'datasus_cache'",
                     [self.name],
                 ).fetchone()[0]
                 return bool(count)
@@ -534,12 +522,12 @@ class _GroupCache:
                 pass  # cai no fallback abaixo
 
         if self.connection is None:
-            LOGGER.warning("grupo %s: conexão não aberta ao chamar _cache_table_exists; abrindo", self.name)
+            LOGGER.warning("grupo %s: conexÃ£o nÃ£o aberta ao chamar _cache_table_exists; abrindo", self.name)
             self.reopen()
         if self._using_main_connection:
             return bool(self.connection.execute(
                 "SELECT COUNT(*) FROM duckdb_tables() "
-                "WHERE database_name = ? AND table_name = 'datasus_cache'",
+                "WHERE LOWER(database_name) = LOWER(?) AND table_name = 'datasus_cache'",
                 [self.name]
             ).fetchone()[0])
         return bool(self._scalar(
@@ -548,24 +536,24 @@ class _GroupCache:
         ))
 
     def _cache_view_exists(self) -> bool:
-        """True quando a relação datasus_cache existe como VIEW (modo S1)."""
+        """True quando a relaÃ§Ã£o datasus_cache existe como VIEW (modo S1)."""
         if self.connection is None and self.main_connection is not None:
             try:
                 count = self.main_connection.execute(
                     "SELECT COUNT(*) FROM duckdb_views() "
-                    "WHERE database_name = ? AND view_name = 'datasus_cache'",
+                    "WHERE LOWER(database_name) = LOWER(?) AND view_name = 'datasus_cache'",
                     [self.name],
                 ).fetchone()[0]
                 return bool(count)
             except Exception:
                 pass
         if self.connection is None:
-            LOGGER.warning("grupo %s: conexão não aberta ao chamar _cache_view_exists; abrindo", self.name)
+            LOGGER.warning("grupo %s: conexÃ£o nÃ£o aberta ao chamar _cache_view_exists; abrindo", self.name)
             self.reopen()
         if self._using_main_connection:
             return bool(self.connection.execute(
                 "SELECT COUNT(*) FROM duckdb_views() "
-                "WHERE database_name = ? AND view_name = 'datasus_cache'",
+                "WHERE LOWER(database_name) = LOWER(?) AND view_name = 'datasus_cache'",
                 [self.name]
             ).fetchone()[0])
         return bool(self._scalar(
@@ -576,22 +564,22 @@ class _GroupCache:
     def _cache_relation_exists(self) -> bool:
         """True quando datasus_cache existe como TABELA (legado) OU VIEW (S1).
 
-        No modo S1 (DATASUS_CACHE_AS_VIEW=true) o cache do grupo é uma VIEW sobre
+        No modo S1 (DATASUS_CACHE_AS_VIEW=true) o cache do grupo Ã© uma VIEW sobre
         os Parquet, portanto _cache_table_exists() retorna False. Este helper cobre
-        os dois modos e evita que o pipeline reingira tudo a cada inicialização.
+        os dois modos e evita que o pipeline reingira tudo a cada inicializaÃ§Ã£o.
         """
         return self._cache_table_exists() or self._cache_view_exists()
 
     def _datasus_view_exists(self) -> bool:
         if self.connection is None:
-            LOGGER.warning("grupo %s: conexão não aberta ao chamar _datasus_view_exists; abrindo", self.name)
+            LOGGER.warning("grupo %s: conexÃ£o nÃ£o aberta ao chamar _datasus_view_exists; abrindo", self.name)
             self.reopen()
         if self._using_main_connection:
             return bool(self.connection.execute(
                 "SELECT COUNT(*) FROM duckdb_views() "
-                "WHERE database_name = ? AND view_name = 'datasus'",
+                "WHERE LOWER(database_name) = LOWER(?) AND view_name = 'datasus'",
                 [self.name]
-            ).fetchone()[0])
+           ).fetchone()[0])
         return bool(self._scalar(
             "SELECT COUNT(*) FROM information_schema.views "
             "WHERE table_schema = 'main' AND table_name = 'datasus'", default=0,
@@ -601,11 +589,11 @@ class _GroupCache:
         return _discover_files_in(self.source_dir)
 
     def _grouped_cache_path(self, source: Path) -> Path:
-        """Retorna o caminho de cache agrupado por ano/mês para um arquivo-fonte deste grupo."""
+        """Retorna o caminho de cache agrupado por ano/mÃªs para um arquivo-fonte deste grupo."""
         return _grouped_cache_path(self.cache_dir, self.name, source)
 
     def _extract_period_from_path(self, path: Path) -> str | None:
-        """Extrai o período (ano/mês) do caminho do cache agrupado.
+        """Extrai o perÃ­odo (ano/mÃªs) do caminho do cache agrupado.
 
         Estrutura: {cache_dir}/{grupo}/{ano}/{mes}/{arquivo}.parquet
         """
@@ -623,7 +611,7 @@ class _GroupCache:
             self.connection.executemany(f"INSERT INTO {period_table} VALUES (?, ?, ?)", records)
 
     def _save_checkpoint(self, batch_index: int, total: int) -> None:
-        """Salva checkpoint de progresso da ingestão do grupo."""
+        """Salva checkpoint de progresso da ingestÃ£o do grupo."""
         sql = (
             f"INSERT OR REPLACE INTO {'group_checkpoint' if not self._using_main_connection else self.name + '.group_checkpoint'} "
             "(key, value) VALUES ('last_batch_index', ?)"
@@ -641,7 +629,7 @@ class _GroupCache:
         self.connection.execute(sql, [str(time.time())])
 
     def _load_checkpoint(self) -> int:
-        """Carrega o último checkpoint salvo. Retorna o índice do último lote processado."""
+        """Carrega o Ãºltimo checkpoint salvo. Retorna o Ã­ndice do Ãºltimo lote processado."""
         table = f"group_checkpoint" if not self._using_main_connection else f"{self.name}.group_checkpoint"
         row = self.connection.execute(
             f"SELECT value FROM {table} WHERE key = 'last_batch_index'"
@@ -685,12 +673,12 @@ class _GroupCache:
         ARQUIVO (parquet_year/parquet_month via ``_VIEW_PERIOD_EXPR``),
         contrariando ``db/period_fields.py`` (fonte unica de verdade do recorte
         temporal). Este helper devolve um fragmento SQL (precedido de virgula)
-        que deriva ``atend_ano``/``atend_mes`` do CAMPO NATIVO do grupo — os
+        que deriva ``atend_ano``/``atend_mes`` do CAMPO NATIVO do grupo â€” os
         MESMOS valores que a tabela fisica materializa na FASE 3 (#3).
 
         Retorna string vazia quando o grupo NAO tem campo de periodo mapeado
         (a view e criada sem essas colunas, e o UNION trata o grupo como
-        "sem periodo" — ver PARTE 1/#5).
+        "sem periodo" â€” ver PARTE 1/#5).
 
         Mantemos ``parquet_year``/``parquet_month`` (``_VIEW_PERIOD_EXPR``) por
         COMPATIBILIDADE (testes e caches legados), mas o recorte passa a usar
@@ -708,8 +696,8 @@ class _GroupCache:
 
         Retorna True se a view foi criada. Substitui a tabela fisica,
         eliminando a copia duplicada. Mantem EXATAMENTE as colunas derivadas
-        (parquet_path, parquet_year, parquet_month) que a tabela tinha — para
-        compatibilidade — e ADICIONA atend_ano/atend_mes do CAMPO NATIVO
+        (parquet_path, parquet_year, parquet_month) que a tabela tinha â€” para
+        compatibilidade â€” e ADICIONA atend_ano/atend_mes do CAMPO NATIVO
         (FASE 4/#4), alinhando a view S1 ao mesmo recorte da tabela fisica.
         Assim o restante do pipeline (prepare_question_cache) usa as colunas
         fisicas em ambos os modos.
@@ -828,7 +816,7 @@ class _GroupCache:
 
         manifest_table = f"file_manifest" if not self._using_main_connection else f"{self.name}.file_manifest"
         cache_table = f"datasus_cache" if not self._using_main_connection else f"{self.name}.datasus_cache"
-        # Carrega o manifesto uma única vez: source -> (size, modified, cached, in_db, invalid)
+        # Carrega o manifesto uma Ãºnica vez: source -> (size, modified, cached, in_db, invalid)
         manifest: dict[str, tuple[int, float, str, int, int]] = {
             source: (size, modified, cached, in_db, invalid)
             for source, size, modified, cached, in_db, invalid in self.connection.execute(
@@ -836,7 +824,7 @@ class _GroupCache:
             ).fetchall()
         }
 
-        # Apenas arquivos NÃO presentes no cache (novos ou alterados) são processados.
+        # Apenas arquivos NÃƒO presentes no cache (novos ou alterados) sÃ£o processados.
         to_ingest: list[Path] = []
         already_cached = 0
         for source in all_files:
@@ -845,8 +833,8 @@ class _GroupCache:
             st = _retry_stat(source)
             if st is None:
                 # Arquivo sumiu / USB desconectado no meio da varredura: salta agora
-                # (pode voltar no próximo ingest quando o disco re-montar).
-                LOGGER.warning("grupo %s: pulando %s (indisponível/desconectado)", self.name, source)
+                # (pode voltar no prÃ³ximo ingest quando o disco re-montar).
+                LOGGER.warning("grupo %s: pulando %s (indisponÃ­vel/desconectado)", self.name, source)
                 continue
 
             target = self._grouped_cache_path(source)
@@ -856,7 +844,7 @@ class _GroupCache:
                     continue
             to_ingest.append(source)
 
-        LOGGER.info("grupo %s: %d novos de %d totais (já em cache: %d)",
+        LOGGER.info("grupo %s: %d novos de %d totais (jÃ¡ em cache: %d)",
                     self.name, len(to_ingest), len(all_files), already_cached)
 
         if not to_ingest:
@@ -872,13 +860,13 @@ class _GroupCache:
         changed = 0
         invalid = 0
 
-        # Checkpoint: retoma do último lote processado (reinício não reprocessa tudo)
+        # Checkpoint: retoma do Ãºltimo lote processado (reinÃ­cio nÃ£o reprocessa tudo)
         checkpoint_index = self._load_checkpoint()
         if checkpoint_index > 0:
-            LOGGER.info("grupo %s: retomando de checkpoint no índice %d (de %d)",
+            LOGGER.info("grupo %s: retomando de checkpoint no Ã­ndice %d (de %d)",
                         self.name, checkpoint_index, len(to_ingest))
-            # Arquivos já processados anteriormente podem já estar no DuckDB.
-            # O manifest detecta os já inseridos; apenas continuamos do checkpoint.
+            # Arquivos jÃ¡ processados anteriormente podem jÃ¡ estar no DuckDB.
+            # O manifest detecta os jÃ¡ inseridos; apenas continuamos do checkpoint.
             checkpoint_index = min(checkpoint_index, len(to_ingest))
 
         for i in range(checkpoint_index, len(to_ingest), batch_size):
@@ -891,11 +879,11 @@ class _GroupCache:
                 st = _retry_stat(source)
                 if st is None:
                     invalid += 1
-                    LOGGER.error("grupo %s: arquivo indisponível (USB?) %s", self.name, source)
+                    LOGGER.error("grupo %s: arquivo indisponÃ­vel (USB?) %s", self.name, source)
                     continue
                 try:
                     if not _retry_copyfile(source, target):
-                        raise OSError("cópia incompleta do arquivo-fonte")
+                        raise OSError("cÃ³pia incompleta do arquivo-fonte")
                     self.connection.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(target)])
                     self.connection.execute(
                         f"INSERT OR REPLACE INTO {manifest_table} (source, size, modified, cached, in_db) "
@@ -908,9 +896,9 @@ class _GroupCache:
                 except Exception as error:
                     invalid += 1
                     LOGGER.error("grupo %s: falha ao ler %s: %s", self.name, source, error)
-                    # Preserva o arquivo-fonte (dados originais) e remove apenas a cópia inválida
-                    # do cache, registrando o arquivo como inválido no manifesto para que não seja
-                    # reprocessado indefinidamente numa próxima ingestão.
+                    # Preserva o arquivo-fonte (dados originais) e remove apenas a cÃ³pia invÃ¡lida
+                    # do cache, registrando o arquivo como invÃ¡lido no manifesto para que nÃ£o seja
+                    # reprocessado indefinidamente numa prÃ³xima ingestÃ£o.
                     target.unlink(missing_ok=True)
                     self.connection.execute(
                         f"INSERT OR REPLACE INTO {manifest_table} "
@@ -922,14 +910,14 @@ class _GroupCache:
                 paths_sql = ", ".join(f"'{p.replace(chr(39), chr(39)*2)}'" for p in batch_cached)
                 if not self._cache_table_exists():
                     # Usa CREATE OR REPLACE para evitar conflito com nomes que existem
-                    # no catálogo main (o DuckDB interpreta `CREATE TABLE ps.datasus_cache`
-                    # de forma ambígua quando `datasus_cache` já existe no main).
+                    # no catÃ¡logo main (o DuckDB interpreta `CREATE TABLE ps.datasus_cache`
+                    # de forma ambÃ­gua quando `datasus_cache` jÃ¡ existe no main).
                     #
-                    # >>> CORREÇÃO: período derivado do CAMINHO COMPLETO do parquet
+                    # >>> CORREÃ‡ÃƒO: perÃ­odo derivado do CAMINHO COMPLETO do parquet
                     # (filename de read_parquet(filename=true)), ancorado no fim do nome
                     # (.parquet) e tolerando sufixo de letra (ex.: SPMG2205a.parquet);
                     # fallback para AAAA/MM das pastas do caminho. Garante
-                    # parquet_year/parquet_month preenchidos já na criação.
+                    # parquet_year/parquet_month preenchidos jÃ¡ na criaÃ§Ã£o.
                     self.connection.execute(
                         f"CREATE OR REPLACE TABLE {cache_table} AS SELECT *, filename AS parquet_path{self._period_projection_exprs()}, "
                         "COALESCE(2000 + CAST(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 1), '') AS INTEGER), "
@@ -938,7 +926,7 @@ class _GroupCache:
                         "NULLIF(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 2), '')) AS parquet_month "
                         f"FROM read_parquet([{paths_sql}], union_by_name = true, filename = true)"
                     )
-                    # Rede de segurança: recalcula o período de quem ainda ficou NULL
+                    # Rede de seguranÃ§a: recalcula o perÃ­odo de quem ainda ficou NULL
                     # a partir de parquet_path (idempotente).
                     self.connection.execute(
                         f"UPDATE {cache_table} SET "
@@ -950,9 +938,9 @@ class _GroupCache:
                     )
                 else:
                     self.connection.execute("DROP VIEW IF EXISTS temp_batch")
-                    # >>> CORREÇÃO (ver import_batch): inclui 'filename = true' e o alias
+                    # >>> CORREÃ‡ÃƒO (ver import_batch): inclui 'filename = true' e o alias
                     # parquet_path no lote incremental; sem isso parquet_year/parquet_month
-                    # ficavam NULL e o filtro de período descartava o lote inteiro.
+                    # ficavam NULL e o filtro de perÃ­odo descartava o lote inteiro.
                     self.connection.execute(
                         f"CREATE VIEW temp_batch AS SELECT *, filename AS parquet_path "
                         f"FROM read_parquet([{paths_sql}], union_by_name = true, filename = true)"
@@ -968,7 +956,7 @@ class _GroupCache:
                     projection = []
                     for col in table_cols:
                         esc = col.replace('"', '""')
-                        # Os campos de metadados de período são SEMPRE derivados
+                        # Os campos de metadados de perÃ­odo sÃ£o SEMPRE derivados
                         # explicitamente por coluna, para nunca cair no CAST(NULL).
                         if col == "parquet_path":
                             projection.append("filename AS parquet_path")
@@ -993,7 +981,7 @@ class _GroupCache:
                         f"INSERT INTO {cache_table} ({col_list}) SELECT {', '.join(projection)} FROM temp_batch"
                     )
                     self.connection.execute("DROP VIEW temp_batch")
-                    # >>> CORREÇÃO: recomputa o período do lote a partir de parquet_path.
+                    # >>> CORREÃ‡ÃƒO: recomputa o perÃ­odo do lote a partir de parquet_path.
                     self.connection.execute(
                         f"UPDATE {cache_table} SET "
                         "parquet_year = COALESCE(2000 + CAST(NULLIF(regexp_extract(parquet_path, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 1), '') AS INTEGER), "
@@ -1005,22 +993,22 @@ class _GroupCache:
                 escaped = ", ".join("'" + s.replace("'", "''") + "'" for s in batch_sources)
                 self.connection.execute(f"UPDATE {manifest_table} SET in_db = 1 WHERE source IN ({escaped})")
 
-            # Salva checkpoint após cada lote processado
+            # Salva checkpoint apÃ³s cada lote processado
             self._save_checkpoint(i + len(batch), len(to_ingest))
 
         self._ensure_view_and_index([self._grouped_cache_path(f) for f in to_ingest])
         duration = (time.perf_counter() - started) * 1000
-        LOGGER.info("grupo %s: ingestão completa: %d novos, %d inválidos, %.2fms", self.name, changed, invalid, duration)
+        LOGGER.info("grupo %s: ingestÃ£o completa: %d novos, %d invÃ¡lidos, %.2fms", self.name, changed, invalid, duration)
         return {"group": self.name, "files": changed, "invalid": invalid,
                 "already_cached": already_cached, "cache_hit": False}
 
     @log_calls
     def pending_batch(self, limit: int = 50) -> tuple[list[Path], int, int]:
-        """Identifica o próximo lote de arquivos NÃO cacheados deste grupo.
+        """Identifica o prÃ³ximo lote de arquivos NÃƒO cacheados deste grupo.
 
         Returns:
             (lote, total_pendentes, total_ja_cacheados)
-        O lote contém no máximo `limit` arquivos, respeitando a segmentação global.
+        O lote contÃ©m no mÃ¡ximo `limit` arquivos, respeitando a segmentaÃ§Ã£o global.
         """
         all_files = self.discover_files()
         if not all_files:
@@ -1042,7 +1030,7 @@ class _GroupCache:
             st = _retry_stat(source)
             if st is None:
                 # USB desconectado/suspenso durante a varredura: deixa para o
-                # próximo ingest, não derruba o processo.
+                # prÃ³ximo ingest, nÃ£o derruba o processo.
                 continue
             target = self._grouped_cache_path(source)
             if rec is not None and rec[0] == st.st_size and rec[1] == st.st_mtime:
@@ -1050,32 +1038,41 @@ class _GroupCache:
                     already_cached += 1
                     continue
                 if rec[4] == 1:
-                    # Arquivo marcado como inválido: preservado no fonte, não reprocessado.
+                    # Arquivo marcado como invÃ¡lido: preservado no fonte, nÃ£o reprocessado.
                     continue
             pending.append(source)
 
-        # Grupo ainda sem tabela/view de cache: trata tudo como pendente (reconstrução).
-        if not pending and not self._cache_relation_exists():
-            pending = list(all_files)
+        # Sem relacao de cache ainda: reconstrucao a partir dos Parquets.
+        # ATENCAO: NAO re-incluir arquivos ja marcados como invalidos no
+        # manifesto (invalid=1). Caso contrario, quando TODOS os Parquets do
+        # grupo sao invalidos o lote nunca produz `batch_cached`, a relacao de
+        # cache nunca e criada, `already_cached` continua 0 e este guard
+        # re-adiciona tudo indefinidamente -> loop infinito na inicializacao.
+        if not pending and already_cached == 0 and not self._cache_relation_exists():
+            pending = [
+                f
+                for f in all_files
+                if (manifest.get(str(f.relative_to(self.source_dir))) or (0, 0, "", 0, 0))[4] != 1
+            ]
             already_cached = 0
 
         batch = pending[:limit]
-        LOGGER.info("grupo %s: lote de %d pendentes de %d totais (já em cache: %d)",
+        LOGGER.info("grupo %s: lote de %d pendentes de %d totais (jÃ¡ em cache: %d)",
                     self.name, len(batch), len(all_files), already_cached)
         return batch, len(pending), already_cached
 
     @log_calls
     def import_batch(self, batch: list[Path]) -> dict[str, Any]:
-        """Importa um lote (até 50 arquivos) dos Parquet no DuckDB deste grupo."""
+        """Importa um lote (atÃ© 50 arquivos) dos Parquet no DuckDB deste grupo."""
         changed = 0
         invalid = 0
         batch_cached: list[str] = []
         batch_sources: list[str] = []
 
-        # Total de arquivos para cálculo do percentual de progresso
+        # Total de arquivos para cÃ¡lculo do percentual de progresso
         all_files = self.discover_files()
         total_files = len(all_files)
-        # Arquivos já processados anteriormente (checkpoint)
+        # Arquivos jÃ¡ processados anteriormente (checkpoint)
         processed_before = self._load_checkpoint()
 
         manifest_table = f"file_manifest" if not self._using_main_connection else f"{self.name}.file_manifest"
@@ -1088,11 +1085,11 @@ class _GroupCache:
             st = _retry_stat(source)
             if st is None:
                 invalid += 1
-                LOGGER.error("grupo %s: arquivo indisponível (USB?) %s", self.name, source)
+                LOGGER.error("grupo %s: arquivo indisponÃ­vel (USB?) %s", self.name, source)
                 continue
             try:
                 if not _retry_copyfile(source, target):
-                    raise OSError("cópia incompleta do arquivo-fonte")
+                    raise OSError("cÃ³pia incompleta do arquivo-fonte")
                 self.connection.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(target)])
                 self.connection.execute(
                     f"INSERT OR REPLACE INTO {manifest_table} (source, size, modified, cached, in_db) "
@@ -1103,12 +1100,12 @@ class _GroupCache:
                 batch_sources.append(rel_str)
                 changed += 1
 
-                # LOG DO ARQUIVO GRAVADO COM NOME, PARQUET, PARTIÇÃO E PERCENTUAL
+                # LOG DO ARQUIVO GRAVADO COM NOME, PARQUET, PARTIÃ‡ÃƒO E PERCENTUAL
                 year_month = self._extract_period_from_path(target)
                 processed_total = processed_before + changed
                 percent = (processed_total / total_files * 100) if total_files > 0 else 0
                 LOGGER.info(
-                    "CACHE GRAVADO | grupo=%s | arquivo=%s | parquet=%s | partição=%s | progresso=%d/%d (%.1f%%)",
+                    "CACHE GRAVADO | grupo=%s | arquivo=%s | parquet=%s | partiÃ§Ã£o=%s | progresso=%d/%d (%.1f%%)",
                     self.name,
                     source.name,
                     target.name,
@@ -1120,9 +1117,9 @@ class _GroupCache:
             except Exception as error:
                 invalid += 1
                 LOGGER.error("grupo %s: falha ao ler %s: %s", self.name, source, error)
-                # Preserva o arquivo-fonte (dados originais) e remove apenas a cópia inválida
-                # do cache, registrando o arquivo como inválido no manifesto para que não seja
-                # reprocessado indefinidamente numa próxima ingestão.
+                # Preserva o arquivo-fonte (dados originais) e remove apenas a cÃ³pia invÃ¡lida
+                # do cache, registrando o arquivo como invÃ¡lido no manifesto para que nÃ£o seja
+                # reprocessado indefinidamente numa prÃ³xima ingestÃ£o.
                 target.unlink(missing_ok=True)
                 self.connection.execute(
                     f"INSERT OR REPLACE INTO {manifest_table} "
@@ -1134,15 +1131,15 @@ class _GroupCache:
             paths_sql = ", ".join(f"'{p.replace(chr(39), chr(39)*2)}'" for p in batch_cached)
             if not self._cache_table_exists():
                 # Usa CREATE OR REPLACE para evitar conflito com nomes que existem
-                # no catálogo main (o DuckDB interpreta `CREATE TABLE ps.datasus_cache`
-                # de forma ambígua quando `datasus_cache` já existe no main).
+                # no catÃ¡logo main (o DuckDB interpreta `CREATE TABLE ps.datasus_cache`
+                # de forma ambÃ­gua quando `datasus_cache` jÃ¡ existe no main).
                 #
-                # >>> CORREÇÃO: o período é derivado do CAMINHO COMPLETO do parquet
+                # >>> CORREÃ‡ÃƒO: o perÃ­odo Ã© derivado do CAMINHO COMPLETO do parquet
                 # (filename retornado por read_parquet(filename=true)), ancorando o
                 # regex no fim do nome (.parquet) e tolerando o sufixo de letra
                 # (ex.: SPMG2205a.parquet). Como fallback, extrai AAAA/MM das pastas
                 # do caminho (.../<grupo>/<ano>/<mes>/arquivo.parquet). Assim
-                # parquet_year/parquet_month são SEMPRE preenchidos na criação.
+                # parquet_year/parquet_month sÃ£o SEMPRE preenchidos na criaÃ§Ã£o.
                 self.connection.execute(
                     f"CREATE OR REPLACE TABLE {cache_table} AS SELECT *, filename AS parquet_path{self._period_projection_exprs()}, "
                     "COALESCE(2000 + CAST(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 1), '') AS INTEGER), "
@@ -1151,8 +1148,8 @@ class _GroupCache:
                     "NULLIF(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 2), '')) AS parquet_month "
                     f"FROM read_parquet([{paths_sql}], union_by_name = true, filename = true)"
                 )
-                # Rede de segurança: qualquer linha que ainda fique com período NULL
-                # é recalculada a partir de parquet_path (idempotente).
+                # Rede de seguranÃ§a: qualquer linha que ainda fique com perÃ­odo NULL
+                # Ã© recalculada a partir de parquet_path (idempotente).
                 self.connection.execute(
                     f"UPDATE {cache_table} SET "
                     "parquet_year = COALESCE(2000 + CAST(NULLIF(regexp_extract(parquet_path, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 1), '') AS INTEGER), "
@@ -1163,12 +1160,12 @@ class _GroupCache:
                 )
             else:
                 self.connection.execute("DROP VIEW IF EXISTS temp_batch")
-                # >>> CORREÇÃO (bug sarampo/B05 -> 0 linhas com dados no cache):
+                # >>> CORREÃ‡ÃƒO (bug sarampo/B05 -> 0 linhas com dados no cache):
                 # inclui 'filename = true' e o alias parquet_path no lote incremental.
-                # Sem isso, 'temp_batch' não tinha 'filename'; como a tabela já possui
+                # Sem isso, 'temp_batch' nÃ£o tinha 'filename'; como a tabela jÃ¡ possui
                 # as colunas 'parquet_path'/'parquet_year'/'parquet_month' (criadas no
-                # 1º lote), o INSERT preenchia-as com CAST(NULL AS VARCHAR). Com
-                # parquet_year NULL, o filtro de período de prepare_question_cache
+                # 1Âº lote), o INSERT preenchia-as com CAST(NULL AS VARCHAR). Com
+                # parquet_year NULL, o filtro de perÃ­odo de prepare_question_cache
                 # (parquet_year IN (...)) descartava TODO o lote e a consulta retornava
                 # 0 mesmo havendo milhares de registros do CID no cache.
                 self.connection.execute(
@@ -1186,7 +1183,7 @@ class _GroupCache:
                 projection = []
                 for col in table_cols:
                     esc = col.replace('"', '""')
-                    # Campos de metadados de período são SEMPRE derivados
+                    # Campos de metadados de perÃ­odo sÃ£o SEMPRE derivados
                     # explicitamente (nunca CAST(NULL)), garantindo que todo lote
                     # incremental grave parquet_path/parquet_year/parquet_month.
                     if col == "parquet_path":
@@ -1208,13 +1205,20 @@ class _GroupCache:
                     else:
                         projection.append('CAST(NULL AS VARCHAR) AS "' + esc + '"')
                 col_list = ", ".join('"' + col.replace('"', '""') + '"' for col in table_cols)
+                # Idempotencia (correcao do loop de ingestao): remove as linhas ja
+                # gravadas para ESTES Parquets antes de reinserir. Sem isso,
+                # reprocessar um lote (ex.: manifesto com mtime desatualizado)
+                # DUPLICA as linhas de datasus_cache.
+                self.connection.execute(
+                    f"DELETE FROM {cache_table} WHERE parquet_path IN ({paths_sql})"
+                )
                 self.connection.execute(
                     f"INSERT INTO {cache_table} ({col_list}) SELECT {', '.join(projection)} FROM temp_batch"
                 )
                 self.connection.execute("DROP VIEW temp_batch")
-                # >>> CORREÇÃO: recomputa parquet_year/parquet_month a partir de
-                # parquet_path para o lote recém-inserido. Antes esse UPDATE só existia
-                # na criação inicial da tabela, deixando os lotes incrementais com
+                # >>> CORREÃ‡ÃƒO: recomputa parquet_year/parquet_month a partir de
+                # parquet_path para o lote recÃ©m-inserido. Antes esse UPDATE sÃ³ existia
+                # na criaÃ§Ã£o inicial da tabela, deixando os lotes incrementais com
                 # parquet_year NULL.
                 self.connection.execute(
                     f"UPDATE {cache_table} SET "
@@ -1227,7 +1231,7 @@ class _GroupCache:
             escaped = ", ".join("'" + s.replace("'", "''") + "'" for s in batch_sources)
             self.connection.execute(f"UPDATE {manifest_table} SET in_db = 1 WHERE source IN ({escaped})")
 
-        # Salva checkpoint para o percentual correto no próximo lote
+        # Salva checkpoint para o percentual correto no prÃ³ximo lote
         if changed > 0 or invalid > 0:
             processed_total = self._load_checkpoint() + changed
             self._save_checkpoint(processed_total, total_files)
@@ -1235,32 +1239,32 @@ class _GroupCache:
         return {"group": self.name, "files": changed, "invalid": invalid}
 
     def _verify_period_integrity(self) -> None:
-        """Valida que TODAS as linhas do cache do grupo têm parquet_year preenchido.
+        """Valida que TODAS as linhas do cache do grupo tÃªm parquet_year preenchido.
 
-        Após qualquer escrita, confere a contagem de linhas sem período. Como o
-        filtro de período de prepare_question_cache (parquet_year IN (...)) DESCARTA
-        linhas com parquet_year NULL, qualquer linha nessa condição se tornaria
-        invisível nas consultas (o bug do sarampo/B05 retornando 0 com dados no
-        cache). Aqui, uma eventual violação é registrada em ERROR e corrigida via
-        backfill a partir de parquet_path — nunca deixando o cache em estado
+        ApÃ³s qualquer escrita, confere a contagem de linhas sem perÃ­odo. Como o
+        filtro de perÃ­odo de prepare_question_cache (parquet_year IN (...)) DESCARTA
+        linhas com parquet_year NULL, qualquer linha nessa condiÃ§Ã£o se tornaria
+        invisÃ­vel nas consultas (o bug do sarampo/B05 retornando 0 com dados no
+        cache). Aqui, uma eventual violaÃ§Ã£o Ã© registrada em ERROR e corrigida via
+        backfill a partir de parquet_path â€” nunca deixando o cache em estado
         silenciosamente incorreto.
         """
         try:
-            # Modo S1: datasus_cache é uma VIEW e parquet_year/parquet_month são
-            # derivados na própria definição da view (não há linhas a backfillar).
-            # O UPDATE abaixo só é aplicável a tabelas físicas.
+            # Modo S1: datasus_cache Ã© uma VIEW e parquet_year/parquet_month sÃ£o
+            # derivados na prÃ³pria definiÃ§Ã£o da view (nÃ£o hÃ¡ linhas a backfillar).
+            # O UPDATE abaixo sÃ³ Ã© aplicÃ¡vel a tabelas fÃ­sicas.
             if self._cache_view_exists() and not self._cache_table_exists():
                 return
             if not self._cache_relation_exists():
                 return
             cache_table = f"datasus_cache" if not self._using_main_connection else f"{self.name}.datasus_cache"
 
-            # Caches legados podem NÃO ter as colunas de metadados (filename,
-            # parquet_path, parquet_year, parquet_month). Nesse caso não há o que
-            # backfillar: o grupo precisa ser reconstruído (ver
+            # Caches legados podem NÃƒO ter as colunas de metadados (filename,
+            # parquet_path, parquet_year, parquet_month). Nesse caso nÃ£o hÃ¡ o que
+            # backfillar: o grupo precisa ser reconstruÃ­do (ver
             # dev_tools/rebuild_group_cache.py). Detectamos isso explicitamente para
-            # não gerar 'Binder Error: Referenced column parquet_year not found' em
-            # consultas de período.
+            # nÃ£o gerar 'Binder Error: Referenced column parquet_year not found' em
+            # consultas de perÃ­odo.
             cols = {
                 row[0]
                 for row in self.connection.execute(f"DESCRIBE {cache_table}").fetchall()
@@ -1272,7 +1276,7 @@ class _GroupCache:
             if faltando:
                 LOGGER.error(
                     "grupo %s: cache LEGADO sem as colunas de metadados %s; "
-                    "consultas com filtro de período falharão para este grupo. "
+                    "consultas com filtro de perÃ­odo falharÃ£o para este grupo. "
                     "Reconstrua com dev_tools/rebuild_group_cache.py %s",
                     self.name, faltando, self.name,
                 )
@@ -1284,7 +1288,7 @@ class _GroupCache:
             if missing == 0:
                 return
             LOGGER.error(
-                "grupo %s: INTEGRIDADE DE PERÍODO: %d linhas com parquet_year NULL; "
+                "grupo %s: INTEGRIDADE DE PERÃODO: %d linhas com parquet_year NULL; "
                 "aplicando backfill a partir de parquet_path", self.name, missing,
             )
             self.connection.execute(
@@ -1300,18 +1304,18 @@ class _GroupCache:
             ).fetchone()[0]
             if missing_after > 0:
                 LOGGER.error(
-                    "grupo %s: ainda restam %d linhas com parquet_year NULL após backfill "
-                    "(sem parquet_path utilizável) — requer reconstrução do grupo.",
+                    "grupo %s: ainda restam %d linhas com parquet_year NULL apÃ³s backfill "
+                    "(sem parquet_path utilizÃ¡vel) â€” requer reconstruÃ§Ã£o do grupo.",
                     self.name, missing_after,
                 )
             else:
-                LOGGER.info("grupo %s: integridade de período restaurada via backfill", self.name)
+                LOGGER.info("grupo %s: integridade de perÃ­odo restaurada via backfill", self.name)
         except Exception:
-            LOGGER.exception("grupo %s: falha ao verificar integridade de período", self.name)
+            LOGGER.exception("grupo %s: falha ao verificar integridade de perÃ­odo", self.name)
 
     @log_calls
     def finalize(self) -> None:
-        """Garante a view 'datasus' e o índice de período após o cache do grupo."""
+        """Garante a view 'datasus' e o Ã­ndice de perÃ­odo apÃ³s o cache do grupo."""
         cached = self._cached_group_files()
         if self._cache_relation_exists() and not self._datasus_view_exists():
             if self._using_main_connection:
@@ -1320,25 +1324,25 @@ class _GroupCache:
                 )
             else:
                 self.connection.execute("CREATE VIEW datasus AS SELECT * FROM datasus_cache")
-        # Garante que nenhuma linha ficou sem período (evita o sintoma de
+        # Garante que nenhuma linha ficou sem perÃ­odo (evita o sintoma de
         # "resultado vazio" em consultas com filtro temporal).
         self._verify_period_integrity()
-        # Reaplica os comentários de coluna (descrição/exemplos do layout) na
+        # Reaplica os comentÃ¡rios de coluna (descriÃ§Ã£o/exemplos do layout) na
         # TABELA datasus_cache, caso ela tenha sido (re)criada/alterada.
         self._apply_column_comments()
         if cached:
             self._refresh_period_index(cached)
 
     def _apply_column_comments(self) -> int:
-        """Aplica descrição/exemplos do layout CSV como comentário nas colunas.
+        """Aplica descriÃ§Ã£o/exemplos do layout CSV como comentÃ¡rio nas colunas.
 
-        Lê ``<cache_dir>/layout_csv/<grupo>.csv`` e grava a descrição (e os
-        exemplos, quando existirem) como COMENTÁRIO das colunas da TABELA
-        ``datasus_cache``. Só comenta quando o campo do CSV coincide EXATAMENTE
-        com uma coluna existente. A VIEW ``datasus`` NÃO é comentada.
+        LÃª ``<cache_dir>/layout_csv/<grupo>.csv`` e grava a descriÃ§Ã£o (e os
+        exemplos, quando existirem) como COMENTÃRIO das colunas da TABELA
+        ``datasus_cache``. SÃ³ comenta quando o campo do CSV coincide EXATAMENTE
+        com uma coluna existente. A VIEW ``datasus`` NÃƒO Ã© comentada.
 
-        Idempotente e best-effort: nunca levanta exceção (falhas são logadas).
-        Não faz nada em modo VIEW (S1), pois não há tabela física para comentar.
+        Idempotente e best-effort: nunca levanta exceÃ§Ã£o (falhas sÃ£o logadas).
+        NÃ£o faz nada em modo VIEW (S1), pois nÃ£o hÃ¡ tabela fÃ­sica para comentar.
         """
         try:
             if not self._cache_table_exists():
@@ -1351,7 +1355,7 @@ class _GroupCache:
                 qualified=self._using_main_connection,
             )
         except Exception:
-            LOGGER.exception("grupo %s: falha ao aplicar comentários de colunas", self.name)
+            LOGGER.exception("grupo %s: falha ao aplicar comentÃ¡rios de colunas", self.name)
             return 0
 
     def _cached_group_files(self) -> list[Path]:

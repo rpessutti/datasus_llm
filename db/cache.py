@@ -22,7 +22,6 @@ from config.settings import PROJECT_DIR, DATASUS_DATA_DIR
 from config.constants import DIAGNOSIS_COLUMN_NAMES, DEFAULT_FETCH_ROWS, FILE_METADATA_COLUMNS
 from core.io_utils import _discover_files_in, _retry_copyfile, _retry_stat, _sync_to_official_cache
 from core.logging_config import log_calls
-from core.duckdb_config import apply_duckdb_experimental_settings
 from core.path_utils import _grouped_cache_path, _schema_rows, _migrate_legacy_cache_paths, _extract_period_from_path
 from db.group_cache import _GroupCache
 from db.column_dictionary import ColumnDictionaryStore, persist_to_duckdb
@@ -299,13 +298,6 @@ class DatasusCache:
                 pass
         except Exception as e:
             LOGGER.warning("erro ao configurar memória do DuckDB: %s", e)
-        finally:
-            # >>> VSS/HNSW: habilita a persistencia EXPERIMENTAL dos indices HNSW <<<
-            # Precisa ser aplicado ANTES de gerar/ler caches que usam indices
-            # HNSW em bancos persistentes (.duckdb). Sem a flag, a criacao/
-            # leitura de indices HNSW persistentes falha no DuckDB. Best-effort:
-            # nao interrompe a inicializacao (ver core/duckdb_config.py).
-            apply_duckdb_experimental_settings(self.connection, label="datasus")
 
     @staticmethod
     def _referenced_columns(sql: str, available: set[str]) -> set[str]:
@@ -2438,7 +2430,24 @@ class DatasusCache:
                     LOGGER.info("processando grupo %s (abre conexão, processa, fecha)", name)
                     self._open_group_if_needed(name)
                     try:
+                        # Rede de seguranca contra nao-convergencia: cada lote
+                        # consome no maximo PER_ITERATION arquivos, portanto um
+                        # grupo com N arquivos nao deveria exigir mais do que
+                        # ~N/PER_ITERATION iteracoes. O limite evita loop
+                        # infinito caso pending_batch continue devolvendo o
+                        # mesmo lote (ex.: arquivos invalidos).
+                        total_group_files = len(group.discover_files())
+                        max_iters = (total_group_files // PER_ITERATION) + 3
+                        iterations = 0
                         while True:
+                            iterations += 1
+                            if iterations > max_iters:
+                                LOGGER.error(
+                                    "grupo %s: ingestão não convergiu após %d lotes "
+                                    "(%d arquivos); interrompendo para evitar loop.",
+                                    name, iterations, total_group_files,
+                                )
+                                break
                             batch, pend_total, already = group.pending_batch(limit=PER_ITERATION)
                             if stats[name]["initial_pending"] is None:
                                 stats[name]["initial_pending"] = pend_total

@@ -29,7 +29,6 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from core.duckdb_config import apply_duckdb_experimental_settings
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "cache"
@@ -71,9 +70,6 @@ def rebuild_group(group: str, dry_run: bool) -> None:
         conn.execute(f"SET threads={threads}")
     except Exception as exc:
         print(f"[{group}] aviso: não foi possível configurar memória/spill: {exc}")
-    # VSS/HNSW: habilita a persistência EXPERIMENTAL dos índices HNSW antes de
-    # regenerar o cache no banco persistente (.duckdb).
-    apply_duckdb_experimental_settings(conn, label=f"grupo {group}")
     conn.execute(f"ATTACH '{db_path}' AS \"{group}\" (READ_WRITE)")
 
     # Materializa a tabela VAZIA com o schema e as colunas derivadas de período.

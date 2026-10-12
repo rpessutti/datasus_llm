@@ -124,6 +124,32 @@ class Settings:
     llm_chart_temperature = float(os.getenv("LLM_CHART_TEMPERATURE", "0.2"))
     llm_chart_max_tokens = int(os.getenv("LLM_CHART_MAX_TOKENS", "2048"))
 
+    # ------------------------------------------------------------------
+    # P0-A: comentários de coluna (descrição/exemplos dos layouts) no prompt.
+    # Os metadados já existem (db/column_comments.py) e eram DESCARTADOS.
+    # Injetá-los no prompt melhora a escolha de coluna pelo LLM.
+    # ------------------------------------------------------------------
+    schema_comments_enabled = (
+        os.getenv("DATASUS_SCHEMA_COMMENTS_ENABLED", "true").casefold()
+        in {"1", "true", "yes", "on"}
+    )
+    # Truncamento (chars) do comentário por coluna — evita inflar o prompt.
+    schema_comment_max_chars = int(os.getenv("DATASUS_SCHEMA_COMMENT_MAX_CHARS", "90"))
+
+    # ------------------------------------------------------------------
+    # P0-B: priorização lexical de colunas/grupos (determinística, sem ONNX).
+    # ------------------------------------------------------------------
+    lexical_rank_enabled = (
+        os.getenv("DATASUS_LEXICAL_RANK_ENABLED", "true").casefold()
+        in {"1", "true", "yes", "on"}
+    )
+
+    # ------------------------------------------------------------------
+    # P2: descoberta de CID retornando TODOS os códigos da doença.
+    # ``cid_discovery_max`` é um TETO DE SANIDADE (não de recall).
+    # ------------------------------------------------------------------
+    cid_discovery_max = int(os.getenv("DATASUS_CID_DISCOVERY_MAX", "200"))
+
 
 setting = Settings()
 DATASUS_DATA_DIR = setting.data_dir

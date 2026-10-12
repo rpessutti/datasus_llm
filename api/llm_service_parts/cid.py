@@ -138,6 +138,25 @@ class _CidMixin(_ServiceBase):
             LOGGER.info("cid discovery ignorado (sem termo de doença) request_id=%s", request_id)
             return ""
 
+        # >>> P2 (2.1): DESCOBERTA DETERMINÍSTICA COMPLETA, sem LLM e sem
+        # truncar. É a fonte PRIMÁRIA: resolve todos os CIDs da doença a partir
+        # do de-para oficial + tabela cid10, com anti-falso-positivo.
+        try:
+            codes_full = self._discover_cid_full(question, request_id)
+        except Exception as exc:  # best-effort
+            LOGGER.warning("cid discovery FULL falhou (%s); usando via LLM. request_id=%s", exc, request_id)
+            codes_full = []
+        if codes_full:
+            return self._cid_discovery_block(codes_full, request_id)
+
+        # >>> FALLBACK (P2): a via "LLM monta o SELECT" só é usada quando a
+        # descoberta determinística NÃO achou nada (ex.: doença fora dos aliases
+        # e sem termos longos). Mantida, mas com pós-processamento que NÃO
+        # trunca (retorna TODAS as linhas) e sem LIMIT artificial na instrução.
+        LOGGER.info(
+            "cid discovery determinística vazia; caindo na via LLM. request_id=%s",
+            request_id,
+        )
         discovery_prompt = (
             "Você é um especialista em SQL DuckDB. Existe uma tabela `cid10` no DuckDB com "
             "o seguinte schema: subcat VARCHAR (código CID-10 SEM ponto, ex.: 'A90', 'B019'), "
@@ -145,7 +164,8 @@ class _CidMixin(_ServiceBase):
             "Escreva UMA consulta SQL DuckDB (SOMENTE o SQL, sem markdown) que liste os "
             "códigos CID-10 (coluna subcat) e suas descrições (coluna descricao) que "
             "correspondam à doença mencionada na pergunta do usuário. Use busca textual "
-            "com ILIKE/upper na coluna descricao. Ordene por subcat e limite a 50 linhas.\n\n"
+            "com ILIKE/upper na coluna descricao. Retorne TODAS as correspondências "
+            "(NÃO use LIMIT): ordene por subcat.\n\n"
             f"Pergunta do usuário: {question}\n"
             "SQL:"
         )
@@ -153,7 +173,7 @@ class _CidMixin(_ServiceBase):
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.0,
-                max_tokens=200,
+                max_tokens=600,
                 timeout=min(self.settings.llm_timeout, self.settings.llm_fix_timeout),
                 messages=[{"role": "user", "content": discovery_prompt}],
             )
@@ -178,23 +198,204 @@ class _CidMixin(_ServiceBase):
             LOGGER.info("cid discovery: nenhum CID encontrado request_id=%s sql=%s", request_id, sql[:300])
             return ""
 
+        # >>> P2: NÃO trunca (antes: rows[:50]). Coleta TODAS as linhas e
+        # prioriza pelos presentes nos dados; o teto de sanidade é o mesmo.
+        try:
+            reais = {p.upper() for p in self._known_cid_prefixes(request_id)}
+        except Exception:
+            reais = set()
+
+        def _presente(cod: str) -> bool:
+            return any(cod[:3] == r[:3] or cod.startswith(r) or r.startswith(cod) for r in reais)
+
+        codes: list[str] = []
+        vistos: set[str] = set()
+        for row in rows:
+            subcat = str(row.get("subcat") or "").strip().upper()
+            if not subcat or subcat in vistos:
+                continue
+            vistos.add(subcat)
+            codes.append(subcat)
+        codes.sort(key=lambda c: (0 if _presente(c) else 1, len(c), c))
+        teto = int(getattr(self.settings, "cid_discovery_max", 200) or 200)
+        if len(codes) > teto:
+            LOGGER.warning(
+                "cid discovery via LLM excedeu teto=%d (achados=%d); truncando. request_id=%s",
+                teto, len(codes), request_id,
+            )
+            codes = codes[:teto]
+
         linhas: list[str] = []
-        for row in rows[:50]:
+        desc_por_cod: dict[str, str] = {}
+        for row in rows:
             subcat = str(row.get("subcat") or "").strip().upper()
             descricao = str(row.get("descricao") or "").strip()
-            if subcat:
-                linhas.append(f"  - {subcat} = {descricao}")
+            if subcat and subcat not in desc_por_cod and descricao:
+                desc_por_cod[subcat] = descricao
+        for cod in codes[:60]:
+            desc = desc_por_cod.get(cod, "")
+            linhas.append(f"  - {cod} = {desc}" if desc else f"  - {cod}")
+        if len(codes) > 60:
+            linhas.append(f"  ... (+{len(codes) - 60} códigos da mesma doença)")
         if not linhas:
             return ""
         LOGGER.info(
-            "cid discovery OK request_id=%s encontrados=%d sql=%s",
-            request_id, len(linhas), sql[:300],
+            "cid discovery OK (via LLM) request_id=%s encontrados=%d sql=%s",
+            request_id, len(codes), sql[:300],
         )
+        cats = sorted({c[:3] for c in codes})
+        exemplo = cats[0] if cats else codes[0]
         return (
             "CIDs DESCOBERTOS PELA PRÓPRIA LLM NA TABELA cid10 (USE ESTES CÓDIGOS):\n"
             + "\n".join(linhas)
             + "\nUse EXATAMENTE um destes códigos (coluna subcat, SEM ponto) na cláusula "
-            "LIKE do filtro de CID, com LIKE 'CODIGO%'."
+            "LIKE 'CODIGO%'. PREFIRA a categoria de 3 caracteres para cobrir as "
+            f"subcategorias (ex.: LIKE '{exemplo}%')."
+        )
+
+    def _discover_cid_full(self, question: str, request_id: str) -> list[str]:
+        """P2 (2.1/2.2): retorna TODOS os CIDs da doença, SEM truncar.
+
+        Substitui a descoberta truncada (``LIMIT 50``/``rows[:50]``) por uma
+        resolução DETERMINÍSTICA contra a tabela ``cid10`` (fonte de verdade):
+
+          1. **Âncora por alias curado** (``CidMap.identificacao_de_alias``):
+             doenças com alias (ex.: tuberculose -> A15–A19; câncer de pele ->
+             C43/C44) definem as FAMÍLIAS corretas. Só entram códigos dessas
+             famílias (anti-falso-positivo, regra 2.2-1).
+          2. **Descoberta por termos** (``CidMap.entries_por_termos``): para
+             doenças SEM alias, casa os termos específicos por SEGMENTO na
+             descrição oficial, exigindo a INTERSEÇÃO (todos os termos) — evita
+             tanto substring solta (2.2-2) quanto over-matching por união.
+          3. **Priorização (não descarte)** pelos prefixos REAIS presentes nos
+             dados (2.2-5) — uma doença válida pode ter 0 casos no recorte.
+          4. **Teto de sanidade** ``settings.cid_discovery_max`` (default 200),
+             nunca usado para cortar recall de doenças com muitas subcategorias.
+
+        Retorna a lista de códigos (formato SUBCAT, sem ponto), ordenada por:
+        (a) presentes nos dados primeiro; (b) categoria de 3 chars antes das
+        subcategorias; (c) ordem alfabética. Lista vazia se não houver doença.
+        """
+        if not question:
+            return []
+        try:
+            from db.cid_map import get_cid_map
+            cid_map = get_cid_map()
+        except Exception as exc:  # pragma: no cover - import defensivo
+            LOGGER.debug("cid_map indisponível p/ descoberta completa: %s", exc)
+            return []
+
+        # 1) Âncora por alias curado (famílias completas), se houver.
+        familias = cid_map.identificacao_de_alias(question)
+        codes: set[str] = set()
+        if familias:
+            for entry in cid_map.familia_completa(familias):
+                codes.add(entry.inicio.upper())
+            # >>> ROBUSTEZ (tabela cid10 ausente): se o catálogo ``cid10`` não
+            # estiver carregado (ex.: ambiente sem a tabela), ``familia_completa``
+            # vem VAZIA. Ainda assim o alias curado JÁ SABE as famílias corretas
+            # (ex.: tuberculose -> A15–A19). Caímos para essas CATEGORIAS de 3
+            # chars, que cobrem as subcategorias via LIKE 'COD%'. Melhor a
+            # família do alias que nada.
+            if not codes:
+                codes.update(f.upper()[:3] for f in familias if len(f) >= 3)
+        # 2) Descoberta por termos (reforça/estende quando não há alias).
+        if not familias:
+            termos = cid_map.termos_doenca(question)
+            for entry in cid_map.entries_por_termos(termos):
+                codes.add(entry.inicio.upper())
+
+        if not codes:
+            return []
+
+        # >>> P2 (2.1) — AGREGAÇÃO DE CATEGORIAS: para cada SUBCATEGORIA de 4
+        # chars encontrada, ADICIONA a CATEGORIA-pai de 3 chars. Motivo: o filtro
+        # SQL é LIKE 'COD%'; recomendar a categoria (ex.: 'B05') cobre TODAS as
+        # subcategorias ('B050'..'B059'). Sem isto, uma doença cujo cid10 só tem
+        # subcategorias (ex.: sarampo -> B050..B059, tuberculosis -> A150..)
+        # ficaria sem a categoria que melhor a representa no LIKE.
+        codes |= {c[:3] for c in codes if len(c) >= 4}
+
+        # 3) Prioriza (NÃO descarta) pelos prefixos reais presentes nos dados.
+        try:
+            reais = {p.upper() for p in self._known_cid_prefixes(request_id)}
+        except Exception:
+            reais = set()
+
+        def _presente(cod: str) -> bool:
+            return any(cod[:3] == r[:3] or cod.startswith(r) or r.startswith(cod) for r in reais)
+
+        ordenados = sorted(
+            codes,
+            key=lambda c: (
+                0 if _presente(c) else 1,   # (a) presentes nos dados primeiro
+                len(c),                      # (b) categoria (3) antes de subcat (4)
+                c,                           # (c) alfabético (determinístico)
+            ),
+        )
+        # 4) Teto de sanidade (não de recall).
+        teto = int(getattr(self.settings, "cid_discovery_max", 200) or 200)
+        if len(ordenados) > teto:
+            LOGGER.warning(
+                "cid discovery completo excedeu teto de sanidade=%d (achados=%d); "
+                "truncando. request_id=%s",
+                teto, len(ordenados), request_id,
+            )
+            ordenados = ordenados[:teto]
+        LOGGER.info(
+            "cid discovery FULL request_id=%s familias=%s codigos=%d",
+            request_id, familias or "(por termos)", len(ordenados),
+        )
+        return ordenados
+
+    def _cid_discovery_block(self, codes: list[str], request_id: str) -> str:
+        """Bloco de prompt a partir da descoberta COMPLETA (P2, 2.3).
+
+        Deixa EXPLÍCITO que todos os códigos são da MESMA doença e orienta a
+        usar a CATEGORIA de 3 chars no ``LIKE`` para cobrir as subcategorias.
+        Cada CATEGORIA é anotada com a descrição oficial (quando disponível),
+        pois é o nível que o filtro ``LIKE 'COD%'`` cobre.
+        """
+        if not codes:
+            return ""
+        # Categorias distintas (3 chars) presentes — usadas como recomendação.
+        cats = sorted({c[:3] for c in codes})
+        # Descrição oficial das categorias (dá contexto à LLM: "B05 = Sarampo").
+        desc_por_cat: dict[str, str] = {}
+        try:
+            from db.cid_map import get_cid_map
+            cid_map = get_cid_map()
+            for cat in cats:
+                desc = cid_map.descricao_de(cat)
+                if desc:
+                    desc = desc.strip()
+                    if len(desc) > 70:
+                        desc = desc[:67] + "..."
+                    desc_por_cat[cat] = desc
+        except Exception:  # best-effort; sem descrição o bloco ainda é útil
+            pass
+
+        linhas: list[str] = []
+        if desc_por_cat:
+            for cat in cats:
+                desc = desc_por_cat.get(cat, "")
+                linhas.append(f"  - {cat}" + (f" = {desc}" if desc else ""))
+        # Mostra até 60 códigos no prompt (o teto de sanidade é 200, mas o
+        # prompt não precisa listar todos; as categorias já cobrem os filhos).
+        if len(codes) <= 60:
+            linhas.extend(f"  - {cod}" for cod in codes)
+        else:
+            linhas.extend(f"  - {cod}" for cod in codes[:60])
+            linhas.append(f"  ... (+{len(codes) - 60} códigos da mesma doença)")
+        exemplo = cats[0] if cats else codes[0]
+        return (
+            "CIDs DA DOENÇA CITADA (TODOS pertencem à MESMA doença; descubra "
+            f"pela tabela cid10 — {len(codes)} código(s), categorias {', '.join(cats)}):\n"
+            + "\n".join(linhas)
+            + "\nUse QUALQUER UM destes códigos (todos são da doença perguntada). "
+            "PREFIRA a CATEGORIA de 3 caracteres no LIKE (ex.: LIKE "
+            f"'{exemplo}%') para cobrir também as subcategorias. NÃO use códigos "
+            "fora desta lista para essa doença."
         )
 
     def _question_mentions_disease(self, question: str) -> bool:
@@ -249,7 +450,18 @@ class _CidMixin(_ServiceBase):
 
         try:
             cid_map = get_cid_map()
-            matches = cid_map.identificar(question, max_resultados=8)
+            # >>> P2 (2.3): usa a FAMÍLIA COMPLETA quando a âncora é um alias
+            # curado (ex.: tuberculose -> A15–A19; câncer de pele -> C43/C44).
+            # Antes, max_resultados=8 truncava e podia perder subcategorias
+            # válidas da mesma doença.
+            familias = cid_map.identificacao_de_alias(question)
+            if familias:
+                entries = cid_map.familia_completa(familias)
+                # Ordena por código p/ determinismo; dedup por família (3 chars).
+                entries = sorted(entries, key=lambda e: e.inicio)
+                matches = entries
+            else:
+                matches = cid_map.identificar(question, max_resultados=8)
         except Exception as exc:  # nunca derruba a geração de SQL
             LOGGER.warning("falha ao resolver CID p/ pergunta (grounding): %s", exc)
             return ""
@@ -259,7 +471,7 @@ class _CidMixin(_ServiceBase):
 
         linhas: list[str] = []
         vistos: set[str] = set()
-        for entry in matches[:6]:
+        for entry in matches[:60]:
             codigo = entry.inicio.upper()
             # >>> SOLUÇÃO A (bug sarampo -> A67/B20): colapsa a SUBCATEGORIA de
             # 4 chars para a CATEGORIA de 3 chars (ex.: B058 -> B05). O filtro
@@ -311,13 +523,14 @@ class _CidMixin(_ServiceBase):
         try:
             from db.cid_map import get_cid_map
             cid_map = get_cid_map()
-            # >>> CORREÇÃO 3 (precisão): usa apenas o TOPO do ranking (3) para
-            # definir a família. Com max_resultados alto, termos genéricos da
-            # pergunta (ex.: "diagnosticos", "muscular") puxavam famílias
-            # irrelevantes (M62/R93/Y57) para a lista, tornando a validação
-            # semântica permissiva. As entradas de MAIOR pontuação representam
-            # a doença real (ex.: atrofia muscular espinal -> G120/G121/G129,
-            # todos da família G12).
+            # >>> P2 (2.3): quando a âncora é um ALIAS CURADO (ex.: tuberculose,
+            # câncer de pele), retorna a FAMÍLIA INTEIRA do alias — não o top-3,
+            # que truncava e enfraquecia a validação semântica. Para perguntas
+            # AMBÍGUAS (sem alias), preserva o comportamento anterior (top-3),
+            # que já era o mais preciso nesse caso.
+            familias_alias = cid_map.identificacao_de_alias(question)
+            if familias_alias:
+                return {f.upper()[:3] for f in familias_alias if len(f) >= 3}
             matches = cid_map.identificar(question, max_resultados=3)
         except Exception as exc:  # pragma: no cover - import defensivo
             LOGGER.debug("falha ao resolver família CID do de-para: %s", exc)

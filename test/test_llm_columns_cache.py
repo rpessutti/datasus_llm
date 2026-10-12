@@ -161,22 +161,99 @@ class TestColumnsCacheCreation(ColumnCacheTestBase):
         )
 
     def test_cache_invalidated_when_source_is_newer(self):
-        """Cache com source_mtime antigo deve ser considerado obsoleto."""
+        """Cache com source_mtime antigo deve ser RECONSTRUÍDO (regra determinística).
+
+        Este teste valida a REGRA de invalidação por mtime sem depender do
+        estado ambiente (mtime real dos arquivos em disco, que muda entre
+        máquinas/execuções). Para isso:
+
+          1. Verifica a regra de comparação usada em ``_build_grupo_columns_cache``
+             (reutiliza somente se ``cached_mtime >= source_mtime``) com valores
+             CONTROLADOS;
+          2. Escreve um cache com ``source_mtime`` ANTIGO e confirma que o método
+             o reconstrói (não reutiliza), restaurando o cache original ao final.
+        """
+        # 1) Regra de comparação com valores controlados (sem tocar em disco).
+        def reutilizavel(cached_mtime: float, source_mtime: float) -> bool:
+            return source_mtime == 0.0 or cached_mtime >= source_mtime
+
+        self.assertTrue(reutilizavel(200.0, 100.0), "cache mais novo que a fonte deve ser reutilizado")
+        self.assertTrue(reutilizavel(100.0, 100.0), "mtime igual deve ser reutilizado")
+        self.assertTrue(reutilizavel(0.0, 0.0), "fonte ausente (0.0) nunca invalida")
+        self.assertFalse(reutilizavel(100.0, 200.0), "cache mais antigo que a fonte deve ser reconstruído")
+
+        # 2) Comportamento real: cache com source_mtime antigo é reconstruído
+        #    a partir da fonte (aqui mockada para ser legível e determinística).
         grupo = self.grupos[0]
         cache_file = self.settings.cache_dir / "colunas_cache" / f"{grupo}.json"
         with open(cache_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertIn("source_mtime", data)
+            original_content = f.read()
+        original = json.loads(original_content)
+        self.assertIn("source_mtime", original)
 
-        # Um cache com mtime menor que a fonte atual deve ser reconstruído;
-        # aqui apenas verificamos a regra de comparação usada pelo método.
-        cached_mtime = float(data.get("source_mtime", 0) or 0)
-        source_mtime = self.cache._grupo_source_signature(grupo)
-        # Regra: reutiliza somente se cached_mtime >= source_mtime (ou fonte=0).
-        reutilizavel = source_mtime == 0.0 or cached_mtime >= source_mtime
-        self.assertTrue(
-            reutilizavel,
-            "Um cache recém-gravado deve ser considerado atualizado",
+        # Força um cache OBSOLETO (mtime bem anterior à fonte) com marcador único.
+        obsoleto = dict(original)
+        obsoleto["source_mtime"] = 0.0 - 1.0  # sempre < source_mtime positivo
+        obsoleto["columns"] = [{"column": "COLUNA_OBSOLETA_MARCADOR", "type": "VARCHAR"}]
+
+        # Mock da leitura da fonte: DESCRIBE "<grupo>".datasus_cache devolve
+        # colunas controladas, garantindo que a reconstrução seja determinística
+        # (independente do estado real do ambiente). Também garante source_mtime>0.
+        fake_rows = [("COL_FAKE_A", "VARCHAR"), ("COL_FAKE_B", "INTEGER")]
+        grupo_obj = self.cache.groups.get(grupo)
+
+        class _FakeCursor:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        real_conn = self.cache.connection
+
+        class _FakeConn:
+            """Proxy que intercepta apenas o DESCRIBE da fonte (caminho 2)."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if "DESCRIBE" in sql and "datasus_cache" in sql:
+                    return _FakeCursor(fake_rows)
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        grupo_conn_backup = getattr(grupo_obj, "connection", None)
+
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(obsoleto, f, ensure_ascii=False, indent=2)
+
+            # Impede o caminho (1) (conexão do grupo) para usar o caminho (2)
+            # (schema anexado), que será mockado.
+            if grupo_obj is not None:
+                grupo_obj.connection = None
+            self.cache.connection = _FakeConn(real_conn)
+
+            cols = self.cache._build_grupo_columns_cache(grupo)
+        finally:
+            self.cache.connection = real_conn
+            if grupo_obj is not None:
+                grupo_obj.connection = grupo_conn_backup
+            # Restaura o cache original para não afetar outros testes.
+            with open(cache_file, "w", encoding="utf-8") as f:
+                f.write(original_content)
+
+        col_names = {str(c.get("column", "")).upper() for c in cols}
+        self.assertNotIn(
+            "COLUNA_OBSOLETA_MARCADOR", col_names,
+            "Cache obsoleto deveria ter sido reconstruído a partir da fonte",
+        )
+        self.assertIn(
+            "COL_FAKE_A", col_names,
+            "A reconstrução deveria usar as colunas lidas da fonte",
         )
 
     def test_cache_not_recreated_when_exists(self):

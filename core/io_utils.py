@@ -75,6 +75,19 @@ def _retry_copyfile(src: Path, dst: Path) -> bool:
         src_stat = _retry_stat(src)
         if src_stat is None:
             return False
+        # >>> CORRECAO (loop infinito de ingestao no boot): quando a origem e o
+        # destino sao o MESMO arquivo (caso em que DATASUS_DATA_DIR nao existe e
+        # o cache agrupado passa a ser a propria origem:
+        # CACHE_DIR/<grupo>/<ano>/<mes>), copiar via ".part" + replace ALTERA o
+        # mtime do arquivo. O manifesto grava o mtime lido ANTES da copia, que
+        # passa a nao casar nunca: o arquivo fica eternamente "pendente" e o
+        # grupo nunca e considerado cacheado (loop no init). Se src == dst, o
+        # arquivo ja esta no lugar; nao ha nada a copiar.
+        try:
+            if src.resolve() == dst.resolve():
+                return True
+        except OSError:
+            pass
         # Copia para um arquivo temporário e depois renomeia, para evitar que uma
         # leitura parcial deixe um .parquet "válido" mas truncado no cache.
         tmp = dst.with_suffix(dst.suffix + ".part")

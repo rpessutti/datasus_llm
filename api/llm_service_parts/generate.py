@@ -70,17 +70,41 @@ class _GenerateMixin(_ServiceBase):
             # grupos mais prováveis e a um número de colunas por grupo.
             MAX_GRUPOS_LABELED = 6
             MAX_COLS_POR_GRUPO = 25
+            # >>> P0-B: priorização lexical de GRUPOS <<<
+            # Antes, o corte de 6 pegaria os PRIMEIROS da ordem alfabética
+            # (``sorted(grupos)``), podendo descartar grupos relevantes. Agora
+            # REORDENAMOS por relevância lexical à pergunta (determinístico,
+            # sem ONNX). NÃO removemos nenhum grupo: o corte continua sendo
+            # MAX_GRUPOS_LABELED — apenas escolhe os mais prováveis.
+            lexical_rank = getattr(self.settings, "lexical_rank_enabled", False)
+            if lexical_rank:
+                try:
+                    from db.lexical_rank import rank_groups as _rank_groups
+                    relevant_grupos = _rank_groups(question, relevant_grupos, column_dict)
+                except Exception as _rank_err:  # pragma: no cover - best-effort
+                    LOGGER.warning("P0-B: rank_groups falhou (%s); mantendo ordem original", _rank_err)
             if len(relevant_grupos) > MAX_GRUPOS_LABELED:
                 grupos_labeled = relevant_grupos[:MAX_GRUPOS_LABELED]
                 LOGGER.info(
-                    "labeled_hint reduzido para %d de %d grupos (CORREÇÃO 1)",
+                    "labeled_hint reduzido para %d de %d grupos (CORREÇÃO 1%s)",
                     len(grupos_labeled),
                     len(relevant_grupos),
+                    " + P0-B lexical" if lexical_rank else "",
                 )
             else:
                 grupos_labeled = relevant_grupos
+            # P0-A: inclui o comentário curto por coluna (descrição/exemplos
+            # dos layouts oficiais) no rótulo por grupo. Controlado por
+            # DATASUS_SCHEMA_COMMENTS_ENABLED e truncado por
+            # DATASUS_SCHEMA_COMMENT_MAX_CHARS (ver config/settings.py).
+            # P0-B: ``rank_question`` reordena as colunas de cada grupo por
+            # relevância ANTES do corte de 25 (as mais prováveis sobrevivem).
             labeled_hint = column_dict.labeled_columns_sql_hint(
-                grupos_labeled, limit_per_group=MAX_COLS_POR_GRUPO
+                grupos_labeled,
+                limit_per_group=MAX_COLS_POR_GRUPO,
+                with_comments=getattr(self.settings, "schema_comments_enabled", False),
+                max_comment_chars=getattr(self.settings, "schema_comment_max_chars", 90),
+                rank_question=question if lexical_rank else None,
             )
             schema = json.dumps({"columns": unique_columns}, ensure_ascii=False, default=str)
             LOGGER.info(
@@ -114,7 +138,19 @@ class _GenerateMixin(_ServiceBase):
             }
             # Fallback (nenhum grupo identificado): limita o rótulo por grupo
             # para não inflar o prompt com centenas de entradas.
-            labeled_hint = column_dict.labeled_columns_sql_hint(limit_per_group=40)
+            # P0-A: comentário por coluna também no fallback (best-effort).
+            # Reduz de 40 -> 25 (igual ao caminho principal) porque, COM os
+            # comentários (P0-A), cada entrada fica ~3x maior; 40 colunas/grupo
+            # em vários grupos inflaria demais o prompt e poderia reativar o
+            # APITimeoutError. 25 preserva cobertura sem estourar o prefill.
+            # P0-B: ``rank_question`` coloca as colunas mais relevantes primeiro
+            # (dentro do corte de 25 por grupo).
+            labeled_hint = column_dict.labeled_columns_sql_hint(
+                limit_per_group=25,
+                with_comments=getattr(self.settings, "schema_comments_enabled", False),
+                max_comment_chars=getattr(self.settings, "schema_comment_max_chars", 90),
+                rank_question=question if getattr(self.settings, "lexical_rank_enabled", False) else None,
+            )
             schema = json.dumps({"columns": unique_columns}, ensure_ascii=False, default=str)
         
         summary_tables = self.cache._summary_tables()
@@ -313,13 +349,41 @@ class _GenerateMixin(_ServiceBase):
                 cid_discovery = self._resolve_cid_grounding(question, request_id)
 
         # 2) Lista dos prefixos REAIS presentes nos dados (validação de escopo).
+        # >>> P2 (otimização): quando a descoberta COMPLETA já trouxe os códigos
+        # da doença (cid_discovery não vazio), a lista bruta de prefixos é apenas
+        # uma referência SECUNDÁRIA — encurtamos para 30 (de 60) para não competir
+        # visualmente com a descoberta nem inflar o prompt. Sem descoberta, mantém
+        # 60 (a lista é a única referência de escopo).
         known_cids = self._known_cid_prefixes(request_id)
+        _limite_prefixos = 30 if cid_discovery else 60
         if known_cids:
+            # >>> P2 (qualidade da lista): exibe apenas CATEGORIAS de 3+ chars
+            # (ex.: 'A90', 'C44'), descartando prefixos curtos de 2 chars
+            # (ex.: 'A0', 'A1') que são ruído para o LLM. Mantém a ordem
+            # original (já priorizada por frequência/presença nos dados).
+            _cats3 = [p for p in known_cids if len(p) >= 3]
+            _lista_prefixos = (_cats3 or known_cids)[:_limite_prefixos]
+            if cid_discovery:
+                # Com a descoberta completa, a lista bruta é SECUNDÁRIA: serve só
+                # para a LLM saber que há outros códigos nos dados; a fonte da
+                # doença é o bloco de descoberta (acima).
+                prefixos_txt = (
+                    "OUTROS PREFIXOS DE CID PRESENTES NOS DADOS (referência "
+                    "SECUNDÁRIA; a doença perguntada já foi resolvida acima — NÃO "
+                    "troque o código indicado acima por um destes): "
+                    + ", ".join(_lista_prefixos)
+                    + "."
+                )
+            else:
+                prefixos_txt = (
+                    "PREFIXOS DE CID REAIS PRESENTES NOS DADOS (referência de escopo; "
+                    "NÃO invente códigos): "
+                    + ", ".join(_lista_prefixos)
+                    + "."
+                )
             cid_grounding = (
-                "PREFIXOS DE CID REAIS PRESENTES NOS DADOS (referência de escopo; "
-                "NÃO invente códigos): "
-                + ", ".join(known_cids[:60])
-                + ".\nSe a doença citada na pergunta NÃO tiver um código correspondente, "
+                prefixos_txt
+                + "\nSe a doença citada na pergunta NÃO tiver um código correspondente, "
                 "NÃO gere um CID inventado: retorne uma consulta que resulte em 0 "
                 "linhas de forma limpa (ex.: adicione 'AND 1=0' ao WHERE)."
             )

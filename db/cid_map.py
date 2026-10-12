@@ -110,14 +110,33 @@ CID_ALIASES: dict[str, tuple[str, ...]] = {
     "malária": ("B50", "B51", "B52", "B53", "B54"),
     "chagas": ("B57",),
     "esquistossomose": ("B65",),
+    # >>> Sepse/septicemia: termo COLOQUIAL "sepse" NÃO aparece literalmente nas
+    # descrições oficiais (que usam "Septicemia" — ex.: A419 "Septicemia não
+    # especificada"); sem o alias, a descoberta por termos retornava VAZIO.
+    "sepse": ("A40", "A41"),
+    "septicemia": ("A40", "A41"),
+    # >>> Pedra nos rins / cálculo renal (coloquial "pedra no rim").
+    "calculose renal": ("N20", "N21", "N23"),
+    "calculo renal": ("N20", "N21", "N23"),
+    "cálculo renal": ("N20", "N21", "N23"),
+    "pedra no rim": ("N20", "N21", "N23"),
+    "pedra nos rins": ("N20", "N21", "N23"),
+    "nefrolitiase": ("N20", "N21", "N23"),
+    "nefrolitíase": ("N20", "N21", "N23"),
     "diabetes": ("E10", "E11", "E12", "E13", "E14"),
     "desnutricao": ("E40", "E41", "E42", "E43", "E44", "E45", "E46"),
     "desnutrição": ("E40", "E41", "E42", "E43", "E44", "E45", "E46"),
     "infarto": ("I21", "I22", "I23"),
+    "enfarte": ("I21", "I22", "I23"),
+    "infarto do miocardio": ("I21", "I22", "I23"),
+    "infarto do miocárdio": ("I21", "I22", "I23"),
     "avc": ("I60", "I61", "I62", "I63", "I64"),
     "derrame": ("I60", "I61", "I62", "I63", "I64"),
+    "derrame cerebral": ("I60", "I61", "I62", "I63", "I64"),
     "hipertensao": ("I10", "I11", "I12", "I13", "I15"),
     "hipertensão": ("I10", "I11", "I12", "I13", "I15"),
+    "pressao alta": ("I10", "I11", "I12", "I13", "I15"),
+    "pressão alta": ("I10", "I11", "I12", "I13", "I15"),
     "pneumonia": ("J12", "J13", "J14", "J15", "J16", "J17", "J18"),
     "asma": ("J45", "J46"),
     "bronquite": ("J20", "J21", "J40", "J41", "J42"),
@@ -153,6 +172,48 @@ CID_ALIASES: dict[str, tuple[str, ...]] = {
     "cegueira": ("H54",),
     "otite": ("H65", "H66", "H67"),
     "obesidade": ("E65", "E66", "E67", "E68"),
+    # >>> SINTOMAS COLOQUIAIS (códigos R da CID-10) <<<
+    # Expressões populares que NÃO aparecem literalmente na descrição oficial
+    # (usam o termo técnico): "falta de ar" → Dispneia (R060), "dor de cabeça"
+    # → Cefaleia (R51). Sem alias, a busca por termo casava por acaso palavras
+    # isoladas ("falta" → X530 "Falta de alimento"; "peito" → P925
+    # "amamentação no peito"), trazendo códigos NÃO relacionados.
+    "falta de ar": ("R060",),
+    "dispneia": ("R060",),
+    "dor de cabeca": ("R51",),
+    "dor de cabeça": ("R51",),
+    "cefaleia": ("R51",),
+    "enxaqueca": ("G43", "G44"),
+    "dor no peito": ("R071", "R072", "R073", "R074"),
+    "dor toracica": ("R071", "R072", "R073", "R074"),
+    "dor torácica": ("R071", "R072", "R073", "R074"),
+    "tosse": ("R05",),
+    "nausea": ("R11",),
+    "náusea": ("R11",),
+    "vomito": ("R11",),
+    "vômito": ("R11",),
+    "tontura": ("R42",),
+    "vertigem": ("R42",),
+    "desmaio": ("R55",),
+    "sincope": ("R55",),
+    "síncope": ("R55",),
+    "febre": ("R509",),
+    "dor de garganta": ("R070",),
+    "amigdalite": ("J03", "J35"),
+    # >>> Sinônimos populares de doenças já cobertas por alias <<<
+    # "catapora" = varicela (B01); "verminose" = helmintíases intestinais
+    # (B68/B71/A07); "amarelão" = ancilostomíase (B76).
+    "catapora": ("B01",),
+    "verminose": ("B68", "B71", "A07"),
+    "vermifugacao": ("B68", "B71", "A07"),
+    # >>> Calculose biliar (coloquial "pedra na vesícula") e glicemia
+    # ("açúcar no sangue" = diabetes — expressão popular).
+    "pedra na vesicula": ("K80",),
+    "pedra na vesícula": ("K80",),
+    "pedra na vesicula biliar": ("K80",),
+    "acucar no sangue": ("E10", "E11", "E12", "E13", "E14"),
+    "açúcar no sangue": ("E10", "E11", "E12", "E13", "E14"),
+    "glicemia alta": ("E10", "E11", "E12", "E13", "E14"),
 }
 
 # Termos genéricos/ruído que NÃO devem ser usados como palavra-chave de busca.
@@ -469,11 +530,23 @@ class CidMap:
     def codigos_para(self, pergunta: str, max_resultados: int = 5) -> list[str]:
         """Atalho que devolve apenas os prefixos de CID (ex.: ['A90', 'A91']).
 
-        Inclui tanto os códigos derivados do ``CID_10.CSV`` quanto os códigos
-        de ALIASES conhecidos -- MESMO quando a categoria não está presente no
-        CSV (ex.: ``U07`` para COVID-19). A ordem preserva a prioridade de
-        especificidade devolvida por :meth:`identificar`.
+        **PRIORIDADE AO ALIAS CURADO (anti-ruído):** quando a pergunta casa um
+        alias curado (ex.: "falta de ar" → R060; "dengue" → A90/A91), são
+        devolvidos **somente** os códigos dos aliases. Isto evita que o
+        casamento por TERMOS introduza ruído: "falta de ar" contém o termo
+        "falta", que casaria por acaso "X530 = Falta de alimento". Como os
+        aliases são CURADOS (específicos e corretos), eles têm precedência.
+
+        Sem alias, cai no comportamento anterior: ``identificar`` (código
+        explícito -> termo) + complemento de aliases que podem NÃO estar no CSV
+        (ex.: U07 = COVID-19). A ordem preserva a prioridade de especificidade.
         """
+        # 1) Alias curado tem PRECEDÊNCIA ABSOLUTA (códigos específicos e
+        #    corretos): devolve as famílias dos aliases casados, sem ruído.
+        familias = self.identificacao_de_alias(pergunta)
+        if familias:
+            return list(familias)
+
         codigos: list[str] = []
         vistos: set[str] = set()
 
@@ -483,25 +556,339 @@ class CidMap:
                     vistos.add(prefixo)
                     codigos.append(prefixo)
 
-        # Complementa com códigos de aliases que podem NÃO estar no CSV
-        # (ex.: U07 = COVID-19). Aliases mais longos primeiro (mais específicos).
-        pergunta_norm = _normalize(pergunta)
-        aliases_match = sorted(
-            (
-                (alias, codigos_alias)
-                for alias, codigos_alias in CID_ALIASES.items()
-                if _normalize(alias) and _normalize(alias) in pergunta_norm
-            ),
-            key=lambda item: len(_normalize(item[0])),
-            reverse=True,
-        )
-        for _, codigos_alias in aliases_match:
-            for codigo in codigos_alias:
-                if codigo not in vistos:
-                    vistos.add(codigo)
-                    codigos.append(codigo)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
         return codigos
+
+    def identificacao_de_alias(self, pergunta: str) -> list[str]:
+        """Retorna as FAMÍLIAS (categorias de 3 chars) dos ALIASES curados.
+
+        P2 (2.2/2.3): um alias curado em ``CID_ALIASES`` (ex.: "tuberculose" ->
+        ``A15``–``A19``; "câncer de pele" -> ``C43``, ``C44``) é uma **âncora**
+        forte. Aqui devolvemos TODAS as famílias que os aliases listam (sem
+        truncar para top-3), na ordem em que aparecem nos aliases — a base para
+        a descoberta "completa" e para a família de validação.
+
+        Suporta **MÚLTIPLAS doenças** na mesma pergunta (ex.: "dengue e sarampo"
+        → ``A90``, ``A91``, ``B05``; "hepatite b e c" → ``B16``, ``B17``) e, ao
+        mesmo tempo, mantém o **anti-falso-positivo** de uma única doença
+        específica: um alias GENÉRICO (ex.: "hepatite", "cancer") é **engolido**
+        pelo alias ESPECÍFICO mais longo que o contém ("hepatite c",
+        "cancer de pele") e NÃO contribui com suas famílias — evitando vazar
+        ``B15``/``B18`` (outras etiologias) ou ``C00``/``C97`` (outras
+        topografias).
+
+        Retorna ``[]`` quando a pergunta NÃO casa com nenhum alias curado (nesse
+        caso a descoberta deve ser mais conservadora — ver ``termos_doenca``).
+        """
+        if not pergunta:
+            return []
+        norm = _normalize(pergunta)
+        if not norm:
+            return []
+        # Todos os aliases que casam, MAIS LONGOS primeiro (mais específicos).
+        matches = sorted(
+            (
+                (_normalize(alias), codigos)
+                for alias, codigos in CID_ALIASES.items()
+                if _normalize(alias) and _normalize(alias) in norm
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+        if not matches:
+            return []
+
+        # >>> SELEÇÃO DE ÂNCORAS (anti-falso-positivo + múltiplas doenças) <<<
+        # Um alias é ENGOLIDO (não é âncora própria) quando é apenas um PREFIXO
+        # textual de OUTRO alias já aceito, MAIS LONGO e ESPECÍFICO:
+        #   "hepatite"      engolido por "hepatite c"     (B17 só, não B15/B18)
+        #   "cancer"        engolido por "cancer de pele"  (C43/C44, não C00/C97)
+        #   "covid-19"      NÃO é prefixo de "covid" (é mais longo) — ambos
+        #                   mapeiam U120/U07, então agregar é inócuo.
+        # Aliases INDEPENDENTES (nenhum é prefixo do outro) são TODOS âncoras:
+        #   "dengue" e "sarampo"        -> A90/A91 + B05
+        #   "hepatite b" e "hepatite c" -> B16 + B17
+        #   "tuberculose" e "aids"      -> A15..A19 + B20..B24
+        ancoras: list[tuple[str, tuple[str, ...]]] = []
+        for alias_norm, codigos in matches:
+            engolido = False
+            for aceito, _cod in ancoras:
+                # ``aceito`` é MAIS LONGO/ESPECÍFICO que ``alias_norm`` (ordem).
+                # Engole se ``alias_norm`` é palavra-prefixo de ``aceito``.
+                if aceito.startswith(alias_norm) and aceito != alias_norm:
+                    # Garante que é prefixo por PALAVRA (não substring solta):
+                    # "hepatite" engole só "hepatite ..."; "hepa" não existe.
+                    if aceito[len(alias_norm):len(alias_norm) + 1] in (" ", ""):
+                        engolido = True
+                        break
+            if not engolido:
+                ancoras.append((alias_norm, codigos))
+
+        familias: list[str] = []
+        vistos: set[str] = set()
+        for _alias_norm, codigos in ancoras:
+            for codigo in codigos:
+                fam = self._canonical_code(codigo)[:3]
+                if len(fam) == 3 and fam not in vistos and fam[0].isalpha():
+                    vistos.add(fam)
+                    familias.append(fam)
+        return familias
+
+    def termos_doenca(self, pergunta: str, min_len: int = 4) -> tuple[str, ...]:
+        """Termos ESPECÍFICOS da doença citada na pergunta (normalizados).
+
+        P2 (2.1): extrai os termos "de doença" da pergunta removendo STOPWORDS e
+        termos genéricos. Usado pela descoberta determinística no ``cid10``.
+
+        ``min_len=4`` (era 5): termos curtos porém VÁLIDOS como doença (ex.:
+        "gota" → M10, "zika") não devem ser descartados. O risco de um termo de
+        4 chars casar por engano (ex.: "pele" em "pelego") é neutralizado pelo
+        casamento por **SEGMENTO INTEIRO + INTERSEÇÃO** em
+        ``entries_por_termos`` — "pele" só casa se também for segmento isolado,
+        e ainda precisa casar com os DEMAIS termos da doença.
+
+        Inclui as descrições dos aliases casados para reforçar a âncora.
+        """
+        if not pergunta:
+            return []
+        norm = _normalize(pergunta)
+        termos: set[str] = set()
+        for tok in norm.split():
+            if len(tok) >= min_len and tok not in _STOPWORDS:
+                termos.add(tok)
+        # Reforça com o TEXTO dos aliases casados (ex.: "cancer de pele" ->
+        # "cancer", "pele" — o alias inteiro normalizado reforça o contexto).
+        for alias, _codigos in CID_ALIASES.items():
+            a = _normalize(alias)
+            if a and a in norm:
+                for parte in a.split():
+                    if len(parte) >= min_len and parte not in _STOPWORDS:
+                        termos.add(parte)
+        return tuple(sorted(termos))
+
+    def familia_completa(self, familias: "list[str] | tuple[str, ...]") -> list[CidEntry]:
+        """Retorna TODAS as entradas do ``cid10`` cujas famílias estão em ``familias``.
+
+        P2 (2.3): usado para que grounding/validação usem a **família inteira**
+        (ex.: todo ``A15``–``A19`` de tuberculose) em vez de um top-N arbitrário.
+        """
+        self._load()
+        fam_set = {f.upper()[:3] for f in familias if f and len(f) >= 3}
+        if not fam_set:
+            return []
+        out: list[CidEntry] = []
+        for entry in self._entries:
+            if entry.inicio.upper()[:3] in fam_set:
+                out.append(entry)
+        return out
+
+    def entries_por_termos(self, termos: "tuple[str, ...] | list[str]") -> list[CidEntry]:
+        """Retorna as entradas cujos segmentos casam com os ``termos`` (COMPLETO).
+
+        P2 (2.1/2.2): casamento restritivo por PALAVRA/SEGMENTO. Cada termo da
+        doença (normalizado, ≥ 4 chars) deve aparecer como **segmento inteiro**
+        em ``descricao``/``descabrev`` (ou, para termos longos ≥ 5 chars, como
+        substring de um segmento — tolera plural).
+
+        **REGRA-CHAVE (anti-over-matching): INTERSEÇÃO, não união.** Uma entrada
+        só qualifica quando casa com **TODOS** os termos de doença. Motivo (bug
+        "esclerose múltipla" → 174 CIDs de doenças não relacionadas): a versão
+        anterior aceitava a entrada se casasse com QUALQUER termo ("esclerose"
+        OU "múltipla"), trazendo aids/tuberculose/câncer. Com a interseção,
+        "esclerose" E "múltipla" casam apenas com ``G35 = Esclerose múltipla``.
+
+        Casamento por termo (uma entrada "casa" com o termo ``t`` se):
+          (a) ``t`` é um segmento inteiro da descrição; OU
+          (b) ``t`` (≥ 5 chars) é substring de um segmento (plural/concordância);
+          OU
+          (c) uma **variante derivada** de ``t`` (adjetivo→substantivo:
+              "macular"→"macula", "espinal"→"espinha"; plural→singular) é um
+              segmento inteiro/substring. Sem isso "degeneração **macular**"
+              nunca casava "degeneração da **mácula**" (H353).
+
+        **Fallback conservador (por RARIDADE):** quando NÃO há interseção
+        completa, não basta contar quantos termos casaram — um termo COMUM
+        ("degeneração" aparece em 13 descrições) infla o resultado e afoga o
+        termo ESPECÍFICO ("macular", raríssimo). Por isso pontuamos cada termo
+        pela sua **raridade** (IDF = log(N / df), onde ``df`` é o nº de entradas
+        que casam) e mantemos as entradas de **maior pontuação**. Assim uma
+        entrada que casa apenas com o termo raro ("macular") vence as que casam
+        apenas com o comum ("degeneração"), preservando recall SEM o ruído de
+        doença não relacionada (ex.: ``degeneracao macular`` → H353, não 25
+        hemorragias/miocardiopatias/etc.).
+        """
+        self._load()
+        termos_ok = tuple(sorted({t for t in termos if len(t) >= 4}))
+        if not termos_ok:
+            return []
+
+        # Pré-computa os segmentos normalizados de cada entrada (uma vez).
+        cache_segs: dict[str, set[str]] = {}
+        for entry in self._entries:
+            segs: set[str] = set()
+            for fonte in (entry.descricao, entry.descricao_abrev):
+                n = _normalize(fonte)
+                segs |= {s for s in re.split(r"[^a-z0-9]+", n) if s}
+            cache_segs[entry.inicio] = segs
+
+        # Variantes de cada termo (plural→singular e adjetivo→substantivo).
+        # Determinístico: cada termo vira um conjunto fixo de formas.
+        termos_var: dict[str, frozenset[str]] = {
+            t: frozenset(self._variantes_termo(t)) for t in termos_ok
+        }
+
+        # Pré-computa, por entrada, QUAIS termos casam (frozenset de índices).
+        # Reutilizado tanto para a interseção quanto para o IDF.
+        casamentos: dict[str, set[int]] = {}
+        for entry in self._entries:
+            segs = cache_segs[entry.inicio]
+            casou: set[int] = set()
+            for idx, termo in enumerate(termos_ok):
+                if any(self._casa_termo(segs, v) for v in termos_var[termo]):
+                    casou.add(idx)
+            if casou:
+                casamentos[entry.inicio] = casou
+
+        if not casamentos:
+            return []
+
+        n_entradas = max(1, len(self._entries))
+
+        # df (document frequency) de cada termo: quantas entradas casam com ele.
+        # Usamos a contagem sobre ``casamentos`` (já computado) — uma passada.
+        df = [0] * len(termos_ok)
+        for casou in casamentos.values():
+            for idx in casou:
+                df[idx] += 1
+
+        # 1) INTERSEÇÃO COMPLETA: entradas que casam com TODOS os termos.
+        n_termos = len(termos_ok)
+        completas = [ini for ini, casou in casamentos.items() if len(casou) == n_termos]
+        if completas:
+            return [self._entry_de(ini) for ini in sorted(completas)]
+
+        # 2) FALLBACK POR RARIDADE (IDF): quando não há interseção, prioriza as
+        # entradas que casam com os termos MAIS RAROS. Um termo que casa com
+        # muitas entradas (comum) contribui pouco; um termo raro domina.
+        import math
+
+        def _idf(idx: int) -> float:
+            # +1 no denominador evita log(0)/divisão por zero.
+            return math.log(n_entradas / (1 + df[idx]))
+
+        pontuados: list[tuple[float, int, str]] = []
+        for ini, casou in casamentos.items():
+            score = sum(_idf(idx) for idx in casou)
+            pontuados.append((score, len(casou), ini))
+        # Ordena: maior score; desempata por mais termos casados; depois código.
+        pontuados.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        melhor_score = pontuados[0][0]
+        melhor_acertos = pontuados[0][1]
+        # Mantém as entradas de MELHOR score E com o MESMO nº de acertos do
+        # topo — evita misturar uma entrada de score alto (termo raro isolado)
+        # com dezenas de score baixo (termo comum). Tolerância relativa de 1%
+        # apenas para estabilidade numérica.
+        limite = melhor_score * 0.99
+        selecionadas = [
+            ini for (score, acertos, ini) in pontuados
+            if score >= limite and acertos == melhor_acertos
+        ]
+        return [self._entry_de(ini) for ini in sorted(selecionadas)]
+
+    # ------------------------------------------------------------------
+    # Auxiliares de casamento de termos
+    # ------------------------------------------------------------------
+    def _entry_de(self, inicio: str) -> CidEntry:
+        """Devolve a entrada de ``self._entries`` com ``inicio`` (já carregado)."""
+        for entry in self._entries:
+            if entry.inicio == inicio:
+                return entry
+        raise KeyError(inicio)  # pragma: no cover - invariante interna
+
+    @staticmethod
+    def _variantes_termo(termo: str) -> set[str]:
+        """Variantes determinísticas de um termo de doença.
+
+        Cobre duas classes de divergência entre a pergunta (coloquial) e a
+        descrição oficial (CID-10):
+
+          1. **Plural → singular** (reuso da lógica de ``_variantes``):
+             "espinais"→"espinal", "atrofias"→"atrofia", "nervosos"→"nervoso".
+          2. **Adjetivo → substantivo** (derivação "culta"): a pergunta usa o
+             ADJETIVO ("macular", "hepática", "pulmonar") e a descrição usa o
+             SUBSTANTIVO ("mácula", "fígado", "pulmão"). Regras conservadoras
+             (só quando sobra um radical ≥ 5 chars):
+               - "-ar" → base ("macular"→"macula", "vascular"→"vascul");
+               - "-tica"/"-tico" → base ("hepatica"→"hepat", "septico"→"sept");
+               - "-osa"/"-oso" → base ("tuberosa"→"tuber").
+             Essas bases SÓ casam por substring de segmento longo (≥ 5 chars),
+             evitando falsos positivos de termos curtos.
+        """
+        v: set[str] = {termo}
+        # Plural → singular (idêntico a ``identificar()._variantes``).
+        if termo.endswith("ais"):                     # espinais -> espinal
+            v.add(termo[:-2] + "l")
+        if termo.endswith("is"):
+            v.add(termo[:-2] + "l")
+        if termo.endswith("as") and len(termo) > 4:   # atrofias -> atrofia
+            v.add(termo[:-1])
+        if termo.endswith("os") and len(termo) > 4:   # nervosos -> nervoso
+            v.add(termo[:-1])
+        if termo.endswith("es") and len(termo) > 4:   # + es -> base
+            v.add(termo[:-2])
+        if termo.endswith("s") and len(termo) > 4:    # musculares -> musculare
+            v.add(termo[:-1])
+        # Adjetivo → radical substantivo (derivação).
+        if termo.endswith("ar") and len(termo) >= 6:      # macular -> macula
+            v.add(termo[:-1])
+        if termo.endswith("tica") and len(termo) >= 7:    # hepatica -> hepat
+            v.add(termo[:-4])
+        if termo.endswith("tico") and len(termo) >= 7:    # septico -> sept
+            v.add(termo[:-4])
+        if termo.endswith("osa") and len(termo) >= 7:     # tuberosa -> tuber
+            v.add(termo[:-3])
+        if termo.endswith("oso") and len(termo) >= 7:     # leproso -> lepr
+            v.add(termo[:-3])
+        return {x for x in v if len(x) >= 4}
+
+    @staticmethod
+    def _casa_termo(segs: set[str], termo: str) -> bool:
+        """True se ``termo`` casa com algum segmento da descrição.
+
+        (a) **segmento inteiro** (evidência forte: "cistite" == "cistite"); OU
+        (b) para termos ≥ 5 chars, o segmento **começa com** o termo (tolera
+            flexão/plural: "cistite" → "cistites", "hepática" → "hepaticas").
+
+        NOTA (bug "cistite" → K80/K81 'colecistite'): a versão anterior aceitava
+        QUALQUER substring ("cistite" dentro de "cole**cistite**"), trazendo
+        doenças de OUTROS órgãos (colecistite = vesícula; cistite = bexiga).
+        Agora exigimos **prefixo** do segmento — "colecistite" começa com
+        "colec", logo NÃO casa; "cistites"/"cistite" começam com "cistite" e
+        casam. As divergências "culta" (adjetivo→substantivo: "macular"→"mácula")
+        são tratadas por ``_variantes_termo``, não por substring.
+        """
+        if termo in segs:
+            return True
+        if len(termo) >= 5 and any(s.startswith(termo) for s in segs):
+            return True
+        return False
 
     @staticmethod
     def _canonical_code(codigo: str) -> str:

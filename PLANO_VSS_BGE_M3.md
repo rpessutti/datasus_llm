@@ -1,6 +1,23 @@
 # Plano de Implementação — Busca Semântica de Grupos/Tabelas com VSS (HNSW) + `bge-m3-onnx-o2-cpu`
 
-> **Status:** PLANO (não implementado). Documento para execução futura.
+> ⚠️ **SUPERSEDIDO — NÃO EXECUTAR COMO ESTÁ.** Este plano foi **ajustado** após análise
+> crítica do código real; o resultado vigente está em **`PLANO_MELHORIA_PROMPT_CID.md`**.
+> Nesta revisão foram **DESCARTADOS**:
+> - **Índice HNSW** (`CREATE INDEX ... USING HNSW`) e a flag
+>   **`hnsw_enable_experimental_persistence`** (persistência experimental → risco de
+>   corrupção; ~16 grupos → busca **linear** basta);
+> - o modelo **`bge-m3` (1024d, ~568M)** em CPU (latência/contensão de threads
+>   desproporcionais ao ganho de escolher entre ~16 grupos) → substituído por priorização
+>   **lexical** (P0) e, se necessário, um modelo **pequeno** (P1);
+> - o **`CHECKPOINT`/`fsync` manual no `.duckdb`** no caminho quente (colide com 16 schemas
+>   anexados).
+>
+> O esforço migrou para: **(P0)** injetar os **comentários de coluna no prompt** +
+> priorização lexical; **(P2)** fazer `_discover_cid_via_llm` retornar **TODOS** os CIDs
+> da doença com **análise restritiva de falso positivo**. Use o documento novo para o plano
+> vigente.
+
+> **Status:** PLANO ANTIGO (não implementado; preservado apenas como histórico).
 > **Modelo de embedding:** `bge-m3-onnx-o2-cpu` — o BGE-M3 (`BAAI/bge-m3`, dimensão **1024**)
 > exportado para **ONNX** e otimizado no nível **O2** para **CPU**
 > (`onnxruntime` + `CPUExecutionProvider`). **Sem dependência de `torch` em produção.**

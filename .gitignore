@@ -81,6 +81,7 @@ db/_disasm*.txt
 # Diretorios de backup de edicao (snapshots manuais de arquivos).
 backup_*/
 _backup/
+_backups/
 # Utilitario local que gera os backups acima (nao faz parte do produto).
 /dev_tools/backup_files.py
 

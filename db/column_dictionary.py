@@ -11,6 +11,8 @@ Recursos principais:
   de grupos diferentes (ex.: ``SEXO`` em ``rd`` vs ``SEXOPAC`` em ``ps``).
 - Persistência opcional em DuckDB (tabela ``column_dictionary``).
 - Dicionários de tradução código->rótulo do DATASUS (sexo, raça/cor, etc.).
+- P0-A: comentários por coluna (descrição/exemplos dos layouts) para INJETAR
+  no prompt do LLM, melhorando a escolha de COLUNA (que hoje só recebe nome+tipo).
 """
 
 from __future__ import annotations
@@ -21,6 +23,13 @@ import os
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+# P0-A: comentários por coluna carregados dos layouts oficiais (best-effort).
+try:
+    from db.column_comments import load_layout, build_comment
+except Exception:  # pragma: no cover - ambientes sem o módulo
+    load_layout = None  # type: ignore[assignment]
+    build_comment = None  # type: ignore[assignment]
 
 try:  # constante centralizada (best-effort; se ausente, usa fallback local)
     from config.constants import DIAGNOSIS_COLUMN_NAMES, DIAGNOSIS_COLUMN_SUFFIXES
@@ -236,6 +245,8 @@ class ColumnDictionary:
 
     by_group: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
     signature: str = ""
+    # P0-A: mapa ``COLUNA_UPPER -> comentário`` (descrição/exemplos do layout).
+    comments: Dict[str, str] = field(default_factory=dict)
 
     # campos derivados (lazy)
     _unique_columns: Optional[List[str]] = field(default=None, repr=False)
@@ -252,6 +263,7 @@ class ColumnDictionary:
         cls,
         grupo_columns: Mapping[str, Sequence[Mapping[str, str]]],
         grupos: Optional[Iterable[str]] = None,
+        cache_dir: Optional[str] = None,
     ) -> "ColumnDictionary":
         by_group: Dict[str, List[Dict[str, str]]] = {}
         selected = set(grupos) if grupos is not None else None
@@ -266,7 +278,47 @@ class ColumnDictionary:
                 norm.append({"column": name, "type": str(c.get("type") or "")})
             by_group[grupo] = norm
         signature = _column_signature(by_group)
-        return cls(by_group=by_group, signature=signature)
+        comments = cls._load_comments(by_group, cache_dir)
+        return cls(by_group=by_group, signature=signature, comments=comments)
+
+    @staticmethod
+    def _load_comments(
+        by_group: Mapping[str, Sequence[Mapping[str, str]]],
+        cache_dir: Optional[str],
+    ) -> Dict[str, str]:
+        """P0-A: carrega comentários (descrição/exemplos do layout) por coluna.
+
+        Best-effort e SILENCIOSO: se ``cache_dir``/``load_layout`` não estiverem
+        disponíveis (ou os layouts não existirem), devolve ``{}`` e o
+        comportamento é idêntico ao anterior. O casamento é por NOME EXATO
+        (coluna do grupo == campo do layout).
+        """
+        if not cache_dir or load_layout is None or build_comment is None:
+            return {}
+        comments: Dict[str, str] = {}
+        # Cache de layout por grupo para não reler o CSV a cada coluna.
+        for grupo, cols in (by_group or {}).items():
+            try:
+                layout = load_layout(cache_dir, grupo)
+            except Exception:  # pragma: no cover - robustez
+                layout = {}
+            if not layout:
+                continue
+            for c in cols or []:
+                name = (c.get("column") or "").strip()
+                if not name:
+                    continue
+                meta = layout.get(name)
+                if not meta:
+                    continue
+                try:
+                    comment = build_comment(meta.get("descricao", ""), meta.get("exemplos", ""))
+                except Exception:  # pragma: no cover
+                    comment = ""
+                up = name.upper()
+                if comment and up not in comments:
+                    comments[up] = comment
+        return comments
 
     def matches(self, signature: str) -> bool:
         return self.signature == signature
@@ -374,35 +426,85 @@ class ColumnDictionary:
         self._ensure()
         return list((self._groups_by_column or {}).get(column.upper(), []))
 
+    def comment_for_column(self, column: str) -> str:
+        """P0-A: comentário (descrição/exemplos) da coluna, ou ``""`` se ausente."""
+        if not column:
+            return ""
+        return self.comments.get(column.upper(), "")
+
     def labeled_columns(
         self,
         grupos: Optional[Iterable[str]] = None,
         limit_per_group: Optional[int] = None,
+        with_comments: bool = False,
+        max_comment_chars: int = 90,
+        rank_question: Optional[str] = None,
     ) -> List[str]:
         """Colunas rotuladas com o grupo de origem (ex.: ``"SEXOPAC" [ps]``).
 
         Quando ``grupos`` é None, usa todos os grupos; ``limit_per_group``
         limita quantas colunas de cada grupo entram (útil no fallback para não
         inflar o prompt com centenas/milhares de entradas).
+
+        P0-A: quando ``with_comments`` é True, anexa a descrição curta da coluna
+        (truncada em ``max_comment_chars``), ex.: ``"AP_CIDPRI" [pa] — CID principal``.
+
+        P0-B: quando ``rank_question`` é fornecida, as colunas de CADA grupo são
+        REORDENADAS por relevância lexical à pergunta ANTES de aplicar
+        ``limit_per_group`` — assim o corte de 25 preserva as colunas mais
+        prováveis (e não apenas as primeiras). Best-effort/opcional.
         """
         if grupos is None:
             self._ensure()
             grupos = sorted(self.by_group.keys())
+        ranker = None
+        if rank_question:
+            try:
+                from db.lexical_rank import rank_columns as _rank_columns
+                ranker = _rank_columns
+            except Exception:  # pragma: no cover - degradação segura
+                ranker = None
         out: List[str] = []
         for grupo in sorted(set(grupos)):
             cols = self.by_group.get(grupo, [])
+            if ranker is not None:
+                names = [c["column"] for c in cols]
+                try:
+                    ordered = ranker(rank_question, names, self.comment_for_column)
+                except Exception:  # pragma: no cover
+                    ordered = names
+                pos = {n: i for i, n in enumerate(ordered)}
+                cols = sorted(cols, key=lambda c: pos.get(c["column"], len(pos)))
             if limit_per_group is not None and limit_per_group > 0:
                 cols = cols[:limit_per_group]
             for c in cols:
-                out.append(f'"{c["column"]}" [{grupo}]')
+                label = f'"{c["column"]}" [{grupo}]'
+                if with_comments:
+                    comment = self.comment_for_column(c["column"])
+                    if comment:
+                        if max_comment_chars and len(comment) > max_comment_chars:
+                            comment = comment[: max_comment_chars - 1].rstrip() + "…"
+                        label = f"{label} — {comment}"
+                out.append(label)
         return out
 
     def labeled_columns_sql_hint(
         self,
         grupos: Optional[Iterable[str]] = None,
         limit_per_group: Optional[int] = None,
+        with_comments: bool = False,
+        max_comment_chars: int = 90,
+        rank_question: Optional[str] = None,
     ) -> str:
-        return ", ".join(self.labeled_columns(grupos, limit_per_group))
+        return ", ".join(
+            self.labeled_columns(
+                grupos,
+                limit_per_group,
+                with_comments=with_comments,
+                max_comment_chars=max_comment_chars,
+                rank_question=rank_question,
+            )
+        )
 
     def to_sql_rows(self) -> List[Tuple[str, str, str]]:
         """Linhas (grupo, coluna, tipo) para persistência em DuckDB."""
@@ -454,9 +556,15 @@ class ColumnDictionaryStore:
         self,
         grupo_columns: Mapping[str, Sequence[Mapping[str, str]]],
         grupos: Optional[Iterable[str]] = None,
+        cache_dir: Optional[str] = None,
     ) -> ColumnDictionary:
-        dictionary = ColumnDictionary.from_grupo_columns(grupo_columns, grupos)
-        sig = dictionary.signature
+        dictionary = ColumnDictionary.from_grupo_columns(grupo_columns, grupos, cache_dir=cache_dir)
+        # P0-A: a chave do cache inclui o cache_dir, pois ele determina se o
+        # dicionário carrega COMENTÁRIOS (descrição/exemplos dos layouts). Sem
+        # isso, um dicionário obtido SEM cache_dir (sem comentários) poderia ser
+        # servido para uma chamada COM cache_dir (e vice-versa), perdendo os
+        # comentários no prompt. A assinatura sozinha não distingue os dois.
+        sig = dictionary.signature + "\x1f" + (str(cache_dir) if cache_dir else "")
         with self._lock:
             cached = self._cache.get(sig)
             if cached is not None:
