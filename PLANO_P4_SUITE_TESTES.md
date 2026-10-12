@@ -67,7 +67,7 @@ Arquivos identificados como scripts (sem testes coletáveis):
 
 | Antes | Depois |
 |---|---|
-| `pytest test/` → `INTERNALERROR` / travamento | `193 tests collected` em ~0,35s |
+| `pytest test/` → `INTERNALERROR` / travamento | `199 tests collected` em ~0,35s |
 | Suíte verde quebrada por teste frágil | **0 failed** (teste frágil reescrito) |
 | Tempo: travava (>2 min) | sem travamento (soma das durações; ver observações) |
 
@@ -76,7 +76,7 @@ Arquivos identificados como scripts (sem testes coletáveis):
 > experimental foi **descartado** em `PLANO_MELHORIA_PROMPT_CID.md`. Por isso o total caiu de
 > **204 → 193** (a coleta continua sem `INTERNALERROR`).
 
-### Distribuição dos 193 testes (por arquivo)
+### Distribuição dos 199 testes (por arquivo)
 
 - `test_agrupamento_mes.py` — 7
 - `test_atend_columns_f3.py` — 7
@@ -92,6 +92,7 @@ Arquivos identificados como scripts (sem testes coletáveis):
 - `test_p2_prompt_cid.py` — 5
 - `test_percentual.py` — 5
 - `test_qualify_sql_f5.py` — 14
+- `test_repair_group_cache.py` — 6 (reparo do cache duplicado, dados fake)
 - `test_safe_io.py` — 6
 - `test_schema_comments_prompt.py` — 10
 - `test_tipos_graficos.py` — 6

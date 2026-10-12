@@ -23,7 +23,17 @@
 | P1 — semântica de grupo (opcional) | ⏳ pendente | — |
 | P2 — CID completo + anti-falso-positivo | ✅ **IMPLEMENTADA** | `_discover_cid_full` + `CidMap.identificacao_de_alias`/`familia_completa`/`termos_doenca`/`entries_por_termos`; ver abaixo |
 | P3 — `core/safe_io.py` | ✅ implementado (pré-requisito) | `core/safe_io.py` + `test/test_safe_io.py` (6 testes) |
-| **P4 — suite de testes determinística** | ✅ **IMPLEMENTADA** | `pytest.ini` + `test/conftest.py` (`collect_ignore` dos scripts manuais) + testes novos por fase; **193 testes coletados** em ~0,35 s, **sem `INTERNALERROR`** — ver `PLANO_P4_SUITE_TESTES.md` |
+| **P4 — suite de testes determinística** | ✅ **IMPLEMENTADA** | `pytest.ini` + `test/conftest.py` (`collect_ignore` dos scripts manuais) + testes novos por fase; **199 testes coletados** em ~0,35 s, **sem `INTERNALERROR`** — ver `PLANO_P4_SUITE_TESTES.md` |
+
+> **⚠️ CORREÇÃO DE DADOS (2026-10-12) — cache dos grupos estava DUPLICADO (2×).**
+> Cada Parquet entrou **duas vezes** em `<grupo>.datasus_cache` (uma com o caminho Linux
+> antigo, outra com o caminho Windows atual) e o `file_manifest` tinha 2× entradas, o que
+> **dobrava COUNT/SUM** de toda resposta que passasse pelos grupos (a view unificada é
+> `UNION ALL` filtrando por período, e as duas cópias têm o mesmo período).
+> Reparo (delete in-place + limpeza de manifesto + guarda de idempotência na ingestão) em
+> **`PLANO_REPARO_CACHE_DUPLICADO.md`** e `dev_tools/repair_group_cache_duplication.py`.
+> **Consequência prática:** qualquer telemetria de acurácia/contagem medida ANTES do reparo
+> está inflada em 2× e deve ser descartada ou reescalada.
 
 **P0-A — o que foi entregue:**
 

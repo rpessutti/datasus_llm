@@ -56,6 +56,18 @@ class _GroupCache:
     """
 
     def __init__(self, name: str, source_dir: Path, cache_dir: Path, main_connection: Any = None) -> None:
+        """Registra o cache de UM grupo (sem abrir conexão DuckDB aqui).
+
+        A conexão é criada sob demanda por :meth:`reopen` — assim só um
+        `<grupo>.duckdb` fica aberto por vez durante a ingestão.
+
+        Args:
+            name: nome do grupo (ex.: ``"er"``, ``"sp"``).
+            source_dir: pasta de origem dos Parquet **deste** grupo.
+            cache_dir: diretório de cache onde vive ``<name>.duckdb``.
+            main_connection: conexão principal (quando o grupo é ANEXADO como
+                schema nela); ``None`` força banco próprio.
+        """
         self.name = name
         self.source_dir = source_dir
         self.cache_dir = cache_dir
@@ -415,6 +427,12 @@ class _GroupCache:
             )
 
     def _configure_memory(self) -> None:
+        """Aplica os PRAGMAs de memória/threads/spill do grupo (best-effort).
+
+        Usa os MESMOS defaults de ``config/settings.py`` para manter consistência
+        com o cache principal. Não faz nada (com log) quando o grupo está em modo
+        "conexão principal", pois os PRAGMAs valem para a conexão inteira.
+        """
         # ConfiguraÃ§Ã£o centralizada em config/settings.py (sugestÃ£o 5)
         # Usa os MESMOS defaults de Settings para manter consistÃªncia entre o
         # cache principal (DatasusCache) e os bancos dos grupos (_GroupCache).
@@ -447,6 +465,20 @@ class _GroupCache:
             LOGGER.exception("grupo %s: nÃ£o foi possÃ­vel aplicar limites de memÃ³ria", self.name)
 
     def _scalar(self, sql: str, params: list[Any] | None = None, default: Any = None) -> Any:
+        """Executa ``sql`` e devolve o primeiro valor da primeira linha.
+
+        Qualifica automaticamente as tabelas internas (``file_manifest``,
+        ``datasus_cache``, ...) quando o grupo usa a conexão principal. Nunca
+        levanta: erros são logados e retorna ``default``.
+
+        Args:
+            sql: consulta escalar.
+            params: parâmetros posicionais (opcional).
+            default: valor devolvido em caso de erro/linha vazia.
+
+        Returns:
+            Any: primeiro valor da primeira linha (ou ``default``).
+        """
         if self.connection is None:
             LOGGER.warning("grupo %s: conexÃ£o nÃ£o aberta ao chamar _scalar; abrindo", self.name)
             self.reopen()
@@ -510,6 +542,14 @@ class _GroupCache:
         return rel_re.sub(_sub, sql)
 
     def _cache_table_exists(self) -> bool:
+        """Informa se ``datasus_cache`` existe como TABELA FÍSICA neste grupo.
+
+        Retorna False no modo S1 (view sobre Parquet) — para cobrir os dois modos
+        use :meth:`_cache_relation_exists`.
+
+        Returns:
+            bool: True quando há tabela física ``datasus_cache``.
+        """
         if self.connection is None and self.main_connection is not None:
             try:
                 count = self.main_connection.execute(
@@ -571,6 +611,12 @@ class _GroupCache:
         return self._cache_table_exists() or self._cache_view_exists()
 
     def _datasus_view_exists(self) -> bool:
+        """Informa se a view de compatibilidade ``datasus`` existe neste grupo.
+
+        Returns:
+            bool: True quando a view ``datasus`` (SELECT * FROM datasus_cache)
+            está registrada no schema do grupo.
+        """
         if self.connection is None:
             LOGGER.warning("grupo %s: conexÃ£o nÃ£o aberta ao chamar _datasus_view_exists; abrindo", self.name)
             self.reopen()
@@ -586,6 +632,11 @@ class _GroupCache:
         ))
 
     def discover_files(self) -> list[Path]:
+        """Lista os Parquet do grupo na pasta de origem (recursivo).
+
+        Returns:
+            list[Path]: arquivos ``*.parquet`` encontrados em ``source_dir``.
+        """
         return _discover_files_in(self.source_dir)
 
     def _grouped_cache_path(self, source: Path) -> Path:
@@ -600,6 +651,14 @@ class _GroupCache:
         return _extract_period_from_path(path)
 
     def _refresh_period_index(self, files: list[Path]) -> None:
+        """Reconstrói o índice ``period_index`` (arquivo → ano, mês) do grupo.
+
+        O período é extraído do NOME do arquivo (padrão ``AAMM`` do DATASUS).
+        A tabela é limpa e repovoada a cada chamada (idempotente).
+
+        Args:
+            files: Parquet cacheados do grupo.
+        """
         records = []
         for path in files:
             match = re.search(r"(\d{2})(0[1-9]|1[0-2])[a-z]*\.parquet$", path.name.casefold())
@@ -796,6 +855,18 @@ class _GroupCache:
         }
 
     def ingest(self) -> dict[str, Any]:
+        """Ingestão COMPLETA do grupo, a partir dos Parquet da pasta de origem.
+
+        Percorre o manifesto, copia para o cache agrupado (``ano/mês``) apenas os
+        arquivos novos/alterados e materializa ``datasus_cache``. Em modo S1
+        (``DATASUS_CACHE_AS_VIEW=true``) delega para :meth:`_ingest_as_view` e não
+        cria tabela física. Verifica cada Parquet antes de registrá-lo e marca os
+        inválidos no manifesto (``invalid=1``) para não reprocessá-los.
+
+        Returns:
+            dict[str, Any]: resumo com ``files`` (ingeridos), ``invalid``,
+            ``already_cached`` e ``cache_hit`` (ou ``status`` no modo S1).
+        """
         started = time.perf_counter()
         all_files = self.discover_files()
         if not all_files:
@@ -977,6 +1048,15 @@ class _GroupCache:
                         else:
                             projection.append('CAST(NULL AS VARCHAR) AS "' + esc + '"')
                     col_list = ", ".join('"' + col.replace('"', '""') + '"' for col in table_cols)
+                    # >>> GUARDA DE IDEMPOTENCIA (reparo 2026-10-12) <<<
+                    # Se o MESMO parquet ja estava na tabela (ex.: a chave do
+                    # manifesto mudou numa migracao Linux->Windows), remove a
+                    # contribuicao anterior ANTES de inserir de novo. Sem isso o
+                    # arquivo entra 2x e as agregacoes saem dobradas.
+                    self.connection.execute(
+                        f"DELETE FROM {cache_table} WHERE parquet_path IN "
+                        f"(SELECT DISTINCT parquet_path FROM temp_batch)"
+                    )
                     self.connection.execute(
                         f"INSERT INTO {cache_table} ({col_list}) SELECT {', '.join(projection)} FROM temp_batch"
                     )
@@ -1212,6 +1292,14 @@ class _GroupCache:
                 self.connection.execute(
                     f"DELETE FROM {cache_table} WHERE parquet_path IN ({paths_sql})"
                 )
+                # >>> GUARDA DE IDEMPOTENCIA (reparo 2026-10-12) <<<
+                # Remove a contribuicao anterior do(s) mesmo(s) parquet(s) antes
+                # de inserir o lote: torna a ingestao idempotente e impede a
+                # duplicacao (2x) que ocorria quando a chave do manifesto mudava.
+                self.connection.execute(
+                    f"DELETE FROM {cache_table} WHERE parquet_path IN "
+                    f"(SELECT DISTINCT parquet_path FROM temp_batch)"
+                )
                 self.connection.execute(
                     f"INSERT INTO {cache_table} ({col_list}) SELECT {', '.join(projection)} FROM temp_batch"
                 )
@@ -1359,9 +1447,23 @@ class _GroupCache:
             return 0
 
     def _cached_group_files(self) -> list[Path]:
+        """Lista os Parquet JÁ CACHEADOS do grupo (``<cache_dir>/<grupo>/**.parquet``).
+
+        Returns:
+            list[Path]: arquivos do cache agrupado por ano/mês.
+        """
         return _discover_files_in(self.cache_dir / self.name)
 
     def _ensure_view_and_index(self, files: list[Path]) -> None:
+        """Garante a view ``datasus`` e o índice de período após escrita incremental.
+
+        Cria a view de compatibilidade quando a relação de cache já existe e ela
+        ainda não foi criada, e reindexa o período quando há arquivos novos (ou
+        quando o índice está ausente).
+
+        Args:
+            files: Parquet recém-processados (usados para o índice).
+        """
         if self._cache_relation_exists() and not self._datasus_view_exists():
             if self._using_main_connection:
                 self.connection.execute(

@@ -79,7 +79,31 @@ def _is_valid_group_name(name: str) -> bool:
 
 
 class DatasusCache:
+    """Cache DuckDB da aplicação: banco principal + um banco ANEXADO por grupo.
+
+    O banco principal (`datasus.duckdb`) guarda `file_manifest`,
+    `cache_metadata`, os resumos `resumo_*` e a tabela `cid10`. Cada grupo do
+    DATASUS (``er``, ``sp``, ``pa``…) vive em ``<grupo>.duckdb``, ANEXADO como
+    schema (`<grupo>.datasus_cache`), e a view unificada
+    `datasus_query_cache` é um ``UNION ALL`` dos grupos selecionados para a
+    pergunta (ver :meth:`prepare_question_cache`).
+
+    A ingestão é increment­al (``pending_batch``/``import_batch``) e a coerência
+    é controlada por `<grupo>.file_manifest` (chave ``source``).
+    """
+
     def __init__(self, settings: Any) -> None:
+        """Abre o banco principal, anexa os grupos e prepara a tabela de CID.
+
+        Args:
+            settings: objeto de configurações (``config.settings.setting`` ou um
+                equivalente em testes) com ``data_dir``/``cache_dir`` etc.
+
+        Efeitos colaterais: cria/abre ``<cache_dir>/datasus.duckdb``, registra os
+        ``_GroupCache`` detectados, carrega a tabela ``cid10`` (best-effort) e
+        inicializa os locks/estado de prontidão usados por
+        :meth:`ensure_ready_sync`.
+        """
         started = time.perf_counter()
         self.settings = settings
         self._ingest_lock = threading.Lock()
@@ -265,6 +289,11 @@ class DatasusCache:
 
     @database_path.setter
     def database_path(self, value: Path) -> None:
+        """Define o caminho do banco principal (usado por testes e reabertura).
+
+        Args:
+            value: novo caminho de ``datasus.duckdb``.
+        """
         self._db_path = value
 
     def _configure_memory(self) -> None:
@@ -1166,6 +1195,11 @@ class DatasusCache:
         return sorted(set(files))
 
     def _indexed_parquet_files(self) -> list[Path]:
+        """Lista os Parquet registrados no índice de período do banco principal.
+
+        Returns:
+            list[Path]: caminhos vindos de ``parquet_period_index``.
+        """
         return [Path(row[0]) for row in self._indexed_parquet_records()]
 
     def indexed_parquet_records(self) -> list[tuple[Path, str, str]]:
@@ -1177,12 +1211,26 @@ class DatasusCache:
         return self._indexed_parquet_records()
 
     def _indexed_parquet_records(self) -> list[tuple[Path, str, str]]:
+        """Lê o índice ``parquet_period_index`` do banco principal.
+
+        Returns:
+            list[tuple[Path, str, str]]: pares ``(caminho, ano, mês)`` ordenados
+            por caminho — base da seleção de arquivos por período.
+        """
         rows = self.connection.execute(
             "SELECT path, parquet_year, parquet_month FROM parquet_period_index ORDER BY path"
         ).fetchall()
         return [(Path(path), str(year), str(month)) for path, year, month in rows]
 
     def _refresh_period_index(self, files: list[Path]) -> None:
+        """Reconstrói o índice ``parquet_period_index`` do banco principal.
+
+        Deriva (ano, mês) do NOME do arquivo (padrão ``AAMM``) e repovoa a tabela
+        (limpa antes de inserir, portanto idempotente).
+
+        Args:
+            files: Parquet do cache a indexar.
+        """
         records = []
         for path in files:
             match = re.search(r"(\d{2})(0[1-9]|1[0-2])[a-z]*\.parquet$", path.name.casefold())
@@ -1454,6 +1502,15 @@ class DatasusCache:
 
     @log_calls
     def question_scope(self, question: str) -> dict[str, Any]:
+        """Resume os arquivos/períodos que a pergunta seleciona (modo legado).
+
+        Args:
+            question: pergunta do usuário.
+
+        Returns:
+            dict[str, Any]: ``{"files": n, "names": [...], "periods": {(ano, mês)}}``
+            ou ``{"files": 0, "error": ...}`` quando a seleção falha.
+        """
         try:
             files = self.select_files_for_question(question)
         except ValueError as e:
@@ -1466,6 +1523,14 @@ class DatasusCache:
 
     @staticmethod
     def _file_periods(files: list[Path]) -> set[tuple[str, str]]:
+        """Extrai o conjunto de períodos (ano, mês) dos NOMES dos arquivos.
+
+        Args:
+            files: caminhos de Parquet.
+
+        Returns:
+            set[tuple[str, str]]: pares ``("2024", "07")`` encontrados.
+        """
         periods: set[tuple[str, str]] = set()
         for path in files:
             match = re.search(r"(\d{2})(0[1-9]|1[0-2])[a-z]*\.parquet$", path.name.casefold())
@@ -1481,6 +1546,26 @@ class DatasusCache:
         sql: str | None = None,
         extra_columns: set[str] | None = None,
     ) -> dict[str, Any]:
+        """Prepara o cache da pergunta criando a view unificada ``datasus_query_cache``.
+
+        Resolve o recorte temporal (pelos índices nativos dos grupos ou, no modo
+        legado, pelos Parquet), monta o ``UNION ALL`` de ``<grupo>.datasus_cache``
+        com filtro por ``atend_ano``/``atend_mes`` (push-down) e o publica como
+        TEMP VIEW (lazy, sem materializar). Grupos sem campo de período mapeado
+        são EXCLUÍDOS do UNION.
+
+        Args:
+            question: pergunta do usuário.
+            request_id: identificador da requisição (telemetria).
+            sql: SQL final, usada para a projeção mínima de colunas (opcional).
+            extra_columns: colunas adicionais que devem ser projetadas (opcional).
+
+        Returns:
+            dict[str, Any]: ``{"files", "names", "periods"}`` do recorte aplicado.
+
+        Raises:
+            RuntimeError: quando nenhum período/grupo corresponde à pergunta.
+        """
         started = time.perf_counter()
         # Guarda a pergunta corrente para permitir RECONSTRUIR a tabela temporaria
         # em ``execute()`` caso a SQL mude de colunas depois (refazer/revisao).
@@ -1727,6 +1812,12 @@ class DatasusCache:
         return self._summary_tables()
 
     def _summary_tables(self) -> list[str]:
+        """Lista quais tabelas de resumo existem no banco principal.
+
+        Returns:
+            list[str]: subconjunto de ``resumo_diagnosticos``,
+            ``resumo_cid_periodo`` e ``resumo_anual_cid``.
+        """
         names = {"resumo_diagnosticos", "resumo_cid_periodo", "resumo_anual_cid"}
         result = self.connection.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
@@ -1783,6 +1874,16 @@ class DatasusCache:
         return sorted(healthy)
 
     def schema_context(self, relation: str = "datasus", include_examples: bool = True) -> dict[str, Any]:
+        """Descreve as colunas de uma relação (nome + tipo) para o prompt do LLM.
+
+        Args:
+            relation: relação consultada (ex.: ``datasus``, ``resumo_cid_periodo``).
+            include_examples: reservado para exemplos de valores por coluna.
+
+        Returns:
+            dict[str, Any]: ``{"columns": [{"column", "type"}, ...]}`` (vazio com
+            log em caso de erro).
+        """
         try:
             conn = self.connection
             schema_rows = conn.execute(f"DESCRIBE {relation}").fetchall()
@@ -1807,6 +1908,19 @@ class DatasusCache:
 
     @log_calls
     def execute(self, sql: str, request_id: str, limite: int | None = None) -> list[dict[str, Any]]:
+        """Executa a SQL final (com reparos seguros) e devolve as linhas.
+
+        Aplica limites (``LIMIT``) e correções estáticas de SQL antes de executar,
+        registra telemetria e devolve a lista de linhas como dicionários.
+
+        Args:
+            sql: SQL gerada/validada a executar.
+            request_id: identificador da requisição (logs/telemetria).
+            limite: teto de linhas pedido na pergunta (opcional).
+
+        Returns:
+            list[dict[str, Any]]: linhas do resultado (vazio em caso de erro).
+        """
         started = time.perf_counter()
         # >>> PARTE 7 (#8): respeita o limite REAL da pergunta. Antes o
         # fetchmany era FIXO em 100. Fallback: DEFAULT_FETCH_ROWS.
@@ -2037,6 +2151,11 @@ class DatasusCache:
         return result
 
     def _datasus_view_exists(self) -> bool:
+        """Informa se a view legada ``datasus`` existe no schema ``main``.
+
+        Returns:
+            bool: True quando a view está registrada.
+        """
         result = self._fetch_scalar(
             "SELECT COUNT(*) FROM information_schema.views WHERE table_schema = 'main' AND table_name = 'datasus'",
             default=0,
@@ -2044,16 +2163,38 @@ class DatasusCache:
         return bool(result)
 
     def is_ready(self) -> bool:
+        """Informa se o cache terminou a inicialização SEM erro.
+
+        Returns:
+            bool: True quando ``ensure_ready_sync`` marcou pronto e não houve
+            erro de startup (senão ``/api/ask`` responde 503).
+        """
         return self._ready.is_set() and self._startup_error is None
 
     def startup_status(self) -> str | None:
+        """Devolve a mensagem de erro da inicialização do cache, se houver.
+
+        Returns:
+            str | None: mensagem de erro (``None`` quando tudo correu bem).
+        """
         return self._startup_error
 
     def mark_ready(self, error: str | None = None) -> None:
+        """Marca o cache como pronto (liberando ``/api/ask``) ou registra o erro.
+
+        Args:
+            error: mensagem de erro de startup; ``None`` indica sucesso.
+        """
         self._startup_error = error
         self._ready.set()
 
     def status(self) -> dict[str, Any]:
+        """Resume o estado do cache: arquivos, linhas, grupos e resumos.
+
+        Returns:
+            dict[str, Any]: ``{"files", "rows", "database", "groups",
+            "summary_tables"}`` — usado pelo endpoint de status.
+        """
         started = time.perf_counter()
         LOGGER.info("status start grupos=%s", list(self.groups))
         if not self.is_ready():
@@ -2130,13 +2271,28 @@ class DatasusCache:
                 raise
 
     def _cached_row_count(self) -> int | None:
+        """Lê o número de linhas memorizado em ``cache_metadata``.
+
+        Returns:
+            int | None: total de linhas do último cálculo, ou ``None`` se ausente.
+        """
         value = self._fetch_scalar("SELECT value FROM cache_metadata WHERE key = 'row_count'")
         return None if value is None else int(value)
 
     def _store_row_count(self, rows: int) -> None:
+        """Grava em ``cache_metadata`` o total de linhas do cache principal.
+
+        Args:
+            rows: total de linhas a memorizar.
+        """
         self.connection.execute("INSERT OR REPLACE INTO cache_metadata VALUES ('row_count', ?)", [rows])
 
     def discover_files(self) -> list[Path]:
+        """Lista os Parquet da pasta de dados configurada (modo legado).
+
+        Returns:
+            list[Path]: arquivos ``*.parquet`` de ``settings.data_dir``.
+        """
         files = _discover_files_in(self.settings.data_dir)
         LOGGER.info(
             "discovered parquet_files=%d data_dir=%s exists=%s",
@@ -2170,6 +2326,19 @@ class DatasusCache:
         return int(row[0] or 0)
 
     def _ingest_locked(self, started: float) -> dict[str, Any]:
+        """Ingestão do modo LEGADO (sem grupos): Parquet → tabela ``datasus_cache``.
+
+        Percorre os arquivos descobertos, valida cada Parquet, copia para o cache
+        e materializa/atualiza a tabela única ``datasus_cache`` (com metadados de
+        período derivados do caminho). Erros por arquivo marcam o registro como
+        inválido em vez de abortar o lote.
+
+        Args:
+            started: ``time.perf_counter()`` do início (para a telemetria).
+
+        Returns:
+            dict[str, Any]: resumo com contagens de arquivos/linhas ingeridos.
+        """
         all_files = self.discover_files()
         if not all_files:
             LOGGER.warning("Nenhum arquivo parquet encontrado para ingestão.")
@@ -2384,6 +2553,16 @@ class DatasusCache:
         return None
 
     def _remove_invalid_file(self, source: Path, target: Path, error: Exception) -> None:
+        """Remove a CÓPIA inválida do cache e preserva o arquivo de origem.
+
+        Usado quando um Parquet não abre: a cópia do cache é descartada para não
+        ser reprocessada indefinidamente; o arquivo-fonte permanece intacto.
+
+        Args:
+            source: caminho do arquivo de origem (preservado).
+            target: cópia no cache (removida).
+            error: exceção que motivou a remoção (apenas para log).
+        """
         LOGGER.error("parquet read failed source=%s cache=%s error=%s", source, target, error)
         try:
             target.unlink(missing_ok=True)
@@ -2514,6 +2693,18 @@ class DatasusCache:
             return self._build_summary_tables_locked(started)
 
     def _build_summary_tables_locked(self, started: float) -> dict[str, Any]:
+        """(Re)constrói as tabelas agregadas ``resumo_*`` a partir dos Parquet.
+
+        Executa sob ``_build_lock`` (ver :meth:`build_summary_tables`): lê os
+        Parquet cacheados, agrega diagnósticos por período/sexo/CID e grava
+        ``resumo_diagnosticos``, ``resumo_cid_periodo`` e ``resumo_anual_cid``.
+
+        Args:
+            started: ``time.perf_counter()`` do início (telemetria).
+
+        Returns:
+            dict[str, Any]: ``{"files", "tables", "duration_ms"}``.
+        """
         files = self._cached_parquet_files()
         if not files:
             raise RuntimeError("Não existem arquivos Parquet no cache para materializar os resumos.")
@@ -2635,6 +2826,11 @@ class DatasusCache:
         }
 
     def _drop_summary_source(self) -> None:
+        """Remove a view temporária ``summary_source`` usada na construção dos resumos.
+
+        Idempotente e best-effort: falhas são ignoradas (a view é recriada na
+        próxima construção das tabelas de resumo).
+        """
         try:
             self.connection.execute("DROP VIEW IF EXISTS summary_source")
         except Exception:

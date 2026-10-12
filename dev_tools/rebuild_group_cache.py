@@ -31,14 +31,41 @@ import duckdb
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 ROOT = Path(__file__).resolve().parent.parent
-CACHE_DIR = ROOT / "cache"
+try:  # usa o cache CONFIGURADO (ex.: D:\datasus\cache); fallback: <projeto>/cache
+    from config.settings import setting as _setting
+
+    CACHE_DIR = Path(_setting.cache_dir)
+except Exception:  # pragma: no cover - ambiente sem config.settings importavel
+    CACHE_DIR = ROOT / "cache"
 
 
 def _parquet_files(group: str) -> list[Path]:
+    """Lista os Parquet cacheados de um grupo (``<CACHE_DIR>/<grupo>/**.parquet``).
+
+    Args:
+        group: nome do grupo (ex.: ``"pa"``).
+
+    Returns:
+        list[Path]: caminhos ordenados dos Parquet usados na reconstrução.
+    """
     return sorted((CACHE_DIR / group).rglob("*.parquet"))
 
 
 def rebuild_group(group: str, dry_run: bool) -> None:
+    """Reconstrói a tabela ``datasus_cache`` de UM grupo a partir dos Parquet.
+
+    Cria a tabela VAZIA com o schema/colunas derivadas de período
+    (``CREATE OR REPLACE TABLE ... LIMIT 0``) e insere os dados em lotes de 100
+    arquivos, com limite de memória e spill em disco. NÃO apaga os Parquet.
+
+    Aviso: o conteúdo anterior da tabela é DESCARTADO (recriada do Parquet) —
+    por isso é a via CARA; para remover apenas linhas duplicadas use
+    ``dev_tools/repair_group_cache_duplication.py --apply``.
+
+    Args:
+        group: nome do grupo a reconstruir.
+        dry_run: quando True, apenas informa o que seria feito.
+    """
     db_path = CACHE_DIR / f"{group}.duckdb"
     files = _parquet_files(group)
     if not db_path.exists():
@@ -160,6 +187,14 @@ def rebuild_group(group: str, dry_run: bool) -> None:
 
 
 def main(argv: list[str]) -> int:
+    """CLI do rebuild: grupos por nome, ``--all`` e ``--dry-run``.
+
+    Args:
+        argv: argumentos de linha de comando (``sys.argv``).
+
+    Returns:
+        int: sempre 0 (erros por grupo são impressos e não interrompem o resto).
+    """
     dry_run = "--dry-run" in argv
     args = [a for a in argv[1:] if not a.startswith("--")]
     if "--all" in argv or not args:
