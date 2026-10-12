@@ -459,6 +459,96 @@ def reparar(
     }
 
 
+def reparar_por_ano(
+    cache_dir_path: Path,
+    grupo: str,
+    remover_nulos: bool = False,
+    min_razao: float = 0.15,
+    force: bool = False,
+) -> dict[str, object]:
+    """Repara um grupo GRANDE em LOTES por ano (cada lote é uma transação própria).
+
+    Feito para bases como ``sp`` (>1 bi de linhas): um único ``DELETE`` sobre
+    ~24 GB de linhas torna a operação longa e sensível a interrupção. Aqui o
+    reparo é fatiado por ``parquet_year`` (DELETE + ``CHECKPOINT`` por ano), de
+    modo que cada ano já reparado fica **persistido**; ao final roda o
+    ``VACUUM``. As linhas sem ano (``parquet_year IS NULL``) são tratadas num
+    último lote. Nenhuma fatia é aplicada se ela deixaria o ano VAZIO.
+
+    Args:
+        cache_dir_path: diretório de cache.
+        grupo: nome do grupo.
+        remover_nulos: remove também linhas com ``parquet_path`` NULL.
+        min_razao: fração mínima de espaço livre (relativa ao tamanho do banco).
+        force: ignora a checagem de espaço livre.
+
+    Returns:
+        dict[str, object]: resultado com ``por_ano`` (linhas removidas por ano),
+        ``compactacao`` e o antes/depois do grupo.
+    """
+    db_path = cache_dir_path / f"{grupo}.duckdb"
+    if not db_path.is_file():
+        return {"grupo": grupo, "erro": f"banco inexistente: {db_path}"}
+
+    ok_espaco, livre_gb, banco_gb = espaco_livre_suficiente(db_path, min_razao)
+    if not ok_espaco and not force:
+        return {
+            "grupo": grupo,
+            "erro": "espaco livre insuficiente para o VACUUM (use --force para ignorar)",
+            "livre_gb": round(livre_gb, 2),
+            "banco_gb": round(banco_gb, 2),
+        }
+
+    antes = diagnosticar(cache_dir_path, grupo)
+    prefixo = str(cache_dir_path).rstrip("/\\") + os.sep
+    con = conectar(db_path, read_only=False)
+    try:
+        linhas_manifesto = limpar_manifesto(con, manifesto_orfaos(con))
+        anos = [
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT parquet_year FROM datasus_cache "
+                "WHERE parquet_year IS NOT NULL ORDER BY 1"
+            ).fetchall()
+        ]
+        por_ano: list[dict[str, object]] = []
+        for ano in anos:
+            manter_ano = contar(
+                con,
+                "SELECT COUNT(*) FROM datasus_cache "
+                "WHERE parquet_year = ? AND starts_with(parquet_path, ?)",
+                [ano, prefixo],
+            )
+            if manter_ano == 0:
+                por_ano.append({"ano": ano, "removidas": 0,
+                                "aviso": "nenhuma linha do cache atual neste ano (pulado)"})
+                continue
+            antes_ano = contar(con, "SELECT COUNT(*) FROM datasus_cache WHERE parquet_year = ?", [ano])
+            condicao = "parquet_year = ? AND NOT starts_with(parquet_path, ?)"
+            if remover_nulos:
+                condicao = f"({condicao}) OR (parquet_year = ? AND parquet_path IS NULL)"
+                con.execute(f"DELETE FROM datasus_cache WHERE {condicao}", [ano, prefixo, ano])
+            else:
+                con.execute(f"DELETE FROM datasus_cache WHERE {condicao}", [ano, prefixo])
+            depois_ano = contar(con, "SELECT COUNT(*) FROM datasus_cache WHERE parquet_year = ?", [ano])
+            con.execute("CHECKPOINT")  # torna a fatia durável (progresso persistido)
+            por_ano.append({"ano": ano, "removidas": antes_ano - depois_ano})
+        compactacao = compactar(con)
+    except duckdb.IOException as exc:
+        return {"grupo": grupo, "erro": f"banco em uso (feche a aplicacao): {exc}"}
+    finally:
+        con.close()
+
+    return {
+        "grupo": grupo,
+        "manifesto_removidas": linhas_manifesto,
+        "por_ano": por_ano,
+        "compactacao": compactacao,
+        "antes": antes,
+        "depois": diagnosticar(cache_dir_path, grupo),
+    }
+
+
 def reconstruir(cache_dir_path: Path, grupo: str) -> dict[str, object]:
     """Caminho CARO (ultimo recurso): recria a tabela a partir dos Parquet.
 
@@ -614,6 +704,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="mede e reporta (padrao quando nao ha --apply/--rebuild)")
     parser.add_argument("--apply", nargs="+", metavar="GRUPO",
                         help="manifesto orfao + linhas duplicadas + CHECKPOINT/VACUUM")
+    parser.add_argument("--apply-por-ano", nargs="+", metavar="GRUPO",
+                        help="igual ao --apply, porem em LOTES por ano (bases gigantes)")
     parser.add_argument("--rebuild", nargs="+", metavar="GRUPO",
                         help="recria a tabela a partir dos Parquet (caro)")
     parser.add_argument("--rewrite", nargs="+", metavar="GRUPO",
@@ -629,6 +721,8 @@ def main(argv: list[str] | None = None) -> int:
     todos = grupos(cache_dir_path)
     if args.apply:
         alvos, modo = args.apply, "apply"
+    elif args.apply_por_ano:
+        alvos, modo = args.apply_por_ano, "apply-por-ano"
     elif args.rewrite:
         alvos, modo = args.rewrite, "rewrite"
     elif args.rebuild:
@@ -650,6 +744,9 @@ def main(argv: list[str] | None = None) -> int:
         elif modo == "apply":
             resultado = reparar(cache_dir_path, grupo, args.remover_paths_nulos,
                                 args.min_free_ratio, args.force)
+        elif modo == "apply-por-ano":
+            resultado = reparar_por_ano(cache_dir_path, grupo, args.remover_paths_nulos,
+                                        args.min_free_ratio, args.force)
         elif modo == "rewrite":
             resultado = compactar_arquivo(cache_dir_path, grupo, args.force)
         else:

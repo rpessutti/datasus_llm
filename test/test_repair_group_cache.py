@@ -34,6 +34,7 @@ from dev_tools.repair_group_cache_duplication import (  # noqa: E402
     manifesto_orfaos,
     parquets_do_grupo,
     reparar,
+    reparar_por_ano,
 )
 
 GRUPO = "zz"
@@ -68,13 +69,15 @@ class RepairGroupCacheTest(unittest.TestCase):
         try:
             lista = "[" + ", ".join("'" + str(p).replace("'", "''") + "'" for p in self.parquets) + "]"
             con.execute(
-                "CREATE TABLE datasus_cache AS SELECT CID, NOME, AA, filename AS parquet_path "
+                "CREATE TABLE datasus_cache AS SELECT CID, NOME, AA, AA AS parquet_year, "
+                f"filename AS parquet_path "
                 f"FROM read_parquet({lista}, union_by_name = true, filename = true)"
             )
             for parquet in self.parquets:  # cópia "antiga" (mesmo arquivo, outra máquina)
                 con.execute(
-                    "INSERT INTO datasus_cache (CID, NOME, AA, parquet_path) "
-                    "SELECT CID, NOME, AA, ? || '/' || ? FROM datasus_cache WHERE parquet_path = ?",
+                    "INSERT INTO datasus_cache (CID, NOME, AA, parquet_year, parquet_path) "
+                    "SELECT CID, NOME, AA, parquet_year, ? || '/' || ? FROM datasus_cache "
+                    "WHERE parquet_path = ?",
                     [CAMINHO_ANTIGO, parquet.name, str(parquet)],
                 )
             con.execute(
@@ -156,6 +159,16 @@ class RepairGroupCacheTest(unittest.TestCase):
         self.assertEqual(depois["manifesto"]["orfaos"], 0)
         self.assertEqual(depois["tabela"]["linhas"], self.total_linhas)
         self.assertEqual(len(parquets_do_grupo(self.cache, GRUPO)), len(self.parquets))
+
+    def test_reparar_por_ano_repara_as_fatias(self) -> None:
+        resultado = reparar_por_ano(self.cache, GRUPO)
+        self.assertNotIn("erro", resultado)
+        self.assertEqual(resultado["depois"]["razao"], 1.0)
+        self.assertEqual(resultado["depois"]["tabela"]["linhas"], self.total_linhas)
+        self.assertEqual(
+            [item["removidas"] for item in resultado["por_ano"]],
+            [LINHAS_POR_ARQUIVO] * len(self.parquets),
+        )
 
     def test_reescrita_preserva_linhas_e_manifesto(self) -> None:
         reparar(self.cache, GRUPO)

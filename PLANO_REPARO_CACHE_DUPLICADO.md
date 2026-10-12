@@ -219,12 +219,12 @@ python -m py_compile db\group_cache.py db\cache.py dev_tools\rebuild_group_cache
 |---|---|---|
 | F0 Inventário | ✅ | `inventario.txt` (métodos/docstrings/mojibake) |
 | F1 Backups integrais | ✅ | `_backups/cache_duplicado_20261012_113100/` + `SHA256SUMS.txt` |
-| F2 Ferramenta de reparo | ✅ | `dev_tools/repair_group_cache_duplication.py` (`--dry-run/--apply/--rewrite/--rebuild`) |
-| F3 Reparo dos dados | ✅ 11 de 14 grupos | ver tabela abaixo (`sp` em execução; `bi`/`pa` bloqueados por espaço) |
+| F2 Ferramenta de reparo | ✅ | `dev_tools/repair_group_cache_duplication.py` (`--dry-run/--apply/--apply-por-ano/--rewrite/--rebuild`) |
+| F3 Reparo dos dados | ✅ 10 de 15 grupos | `--apply` em `er, acf, rj, ar, amp, atd, ps, rd, aq, am`; `sp` (1,26 bi de linhas) via `--apply-por-ano`; `bi`/`pa`/`ab`/`abo` pendentes (espaço / sem banco) |
 | F4 Blindagem da ingestão | ✅ | `import_batch` e `ingest`: `DELETE FROM <cache_table> WHERE parquet_path IN (SELECT DISTINCT parquet_path FROM temp_batch)` antes do INSERT |
 | F5 Rebuild (fallback) | ✅ | `CACHE_DIR = setting.cache_dir` (antes `<projeto>/cache`, vazio) + docstrings |
 | F6 Docstrings | ✅ L1+L2 | `db/group_cache.py` 10, `db/cache.py` 24, `rebuild_group_cache.py` 3, ferramenta nova 100% |
-| F7 Testes | ✅ (parcial) | `test/test_repair_group_cache.py` (6 testes) + 31 testes focados verdes |
+| F7 Testes | ✅ (parcial) | `test/test_repair_group_cache.py` (7 testes) + 42 testes focados de ingestão/views verdes |
 | F8 Fechamento | ⏳ | docs + commit |
 
 ### 8.1 Resultado do reparo (medido, `--apply`)
@@ -259,6 +259,11 @@ Em todos: `parquet_path` distintos = nº de Parquet, `file_manifest` sem órfão
    `sp` foi liberado após o `am` (ficou ~19,7 GB), mas **`bi` (≈44 GB) e `pa`
    (≈74 GB) NÃO cabem** no espaço livre atual — ficam pendentes de mais espaço
    (ou de reescrita em outro volume) antes de `--apply`/`--rewrite`.
+   Em `sp` (1,26 bi de linhas) o `--apply` simples foi interrompido no meio; o
+   estado ficou consistente (manifesto já limpo, tabela intacta com 2×) e o
+   reparo foi refeito com **`--apply-por-ano`**, que fati­a por `parquet_year`
+   (`DELETE` + `CHECKPOINT` por ano) — cada fatia commitada fica persistida, de
+   modo que uma interrupção não perde o progresso dos anos já tratados.
 4. A guarda `keep_rows > 0` (nunca esvaziar a tabela) e a validação de contagem na
    reescrita funcionaram como previsto; `--dry-run` foi idempotente (2ª passada: 0
    removidas, razão já 1,000).

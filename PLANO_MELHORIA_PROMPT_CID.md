@@ -23,7 +23,7 @@
 | P1 — semântica de grupo (opcional) | ⏳ pendente | — |
 | P2 — CID completo + anti-falso-positivo | ✅ **IMPLEMENTADA** | `_discover_cid_full` + `CidMap.identificacao_de_alias`/`familia_completa`/`termos_doenca`/`entries_por_termos`; ver abaixo |
 | P3 — `core/safe_io.py` | ✅ implementado (pré-requisito) | `core/safe_io.py` + `test/test_safe_io.py` (6 testes) |
-| **P4 — suite de testes determinística** | ✅ **IMPLEMENTADA** | `pytest.ini` + `test/conftest.py` (`collect_ignore` dos scripts manuais) + testes novos por fase; **199 testes coletados** em ~0,35 s, **sem `INTERNALERROR`** — ver `PLANO_P4_SUITE_TESTES.md` |
+| **P4 — suite de testes determinística** | ✅ **IMPLEMENTADA** | `pytest.ini` + `test/conftest.py` (`collect_ignore` dos scripts manuais) + testes novos por fase; **200 testes coletados** em ~0,35 s, **sem `INTERNALERROR`** — ver `PLANO_P4_SUITE_TESTES.md` |
 
 > **⚠️ CORREÇÃO DE DADOS (2026-10-12) — cache dos grupos estava DUPLICADO (2×).**
 > Cada Parquet entrou **duas vezes** em `<grupo>.datasus_cache` (uma com o caminho Linux
