@@ -1,7 +1,7 @@
-""">>> Módulo gerado a partir de api/llm_service.py (original preservado) <<<
+""">>> Modulo gerado a partir de api/llm_service.py (original preservado) <<<
 
 Segmento 'ask': mixin _AskMixin com o fluxo principal de pergunta (ask),
-SQL heurístico local e formatação de resposta local.
+SQL heuristico local e formatacao de resposta local.
 Copiado VERBATIM do original.
 """
 from __future__ import annotations
@@ -20,6 +20,23 @@ LOGGER = logging.getLogger("datasus_llm")
 
 
 class _AskMixin(_ServiceBase):
+    def _question_scope(self, question: str) -> dict[str, Any]:
+        """Resume os periodos que a pergunta seleciona.
+
+        Args:
+            question: pergunta do usuario.
+
+        Returns:
+            dict[str, Any]: ``{"files": n, "names": [], "periods": {(ano, mes)}}``.
+        """
+        try:
+            selecionados = self.cache.periods_for_question(question)
+        except Exception as exc:
+            LOGGER.warning("periods_for_question falhou: %s", exc)
+            selecionados = []
+        periodos = {(str(ano), str(mes)) for _, ano, mes in selecionados}
+        return {"files": len(periodos), "names": [], "periods": periodos}
+
     @log_calls
     def ask(
         self,
@@ -27,6 +44,7 @@ class _AskMixin(_ServiceBase):
         request_id: str,
         tipo_grafico: str | None = None,
     ) -> dict[str, Any]:
+        """Responde a pergunta via LLM, com fallback heuristico local."""
         started = time.perf_counter()
         LOGGER.info(
             "question start request_id=%s question=%r llm_enabled=%s tipo_grafico=%s",
@@ -39,23 +57,11 @@ class _AskMixin(_ServiceBase):
         limite_usuario = self._extract_limit_from_question(question)
         LOGGER.info("limite extraído da pergunta request_id=%s limite=%d", request_id, limite_usuario)
         if self.client:
-            question_scope = self.cache.question_scope(question)
-            
-            # >>> NOVO: Se não conseguiu selecionar arquivos, usa todos os dados disponíveis <<<
-            if question_scope.get("error") or question_scope.get("files", 0) == 0:
-                LOGGER.warning("question_scope sem arquivos: %s. Tentando usar todos os dados.", question_scope.get("error", "nenhum arquivo"))
-                # Tenta selecionar usando apenas a pergunta sem período relativo
-                try:
-                    # Limpa o erro do scope e tenta com todos os períodos disponíveis
-                    all_periods = {(year, month) for _, year, month in self.cache._indexed_parquet_records()}
-                    question_scope = {"files": len(all_periods), "names": [], "periods": all_periods}
-                except Exception as scope_e:
-                    LOGGER.warning("falha ao obter todos os períodos: %s", scope_e)
-                    question_scope = {"files": 0, "names": [], "periods": set()}
-            
-            # >>> NOVO: Trata perguntas fora do escopo DATASUS de forma amigável <<<
-            # Se o LLM recusar (pergunta não relacionada a dados do DATASUS/SUS),
-            # retorna uma resposta padrão amigável em vez de propagar erro (HTTP 500).
+            question_scope = self._question_scope(question)
+
+            # >>> NOVO: Trata perguntas fora do escopo DATASUS de forma amigavel <<<
+            # Se o LLM recusar (pergunta nao relacionada a dados do DATASUS/SUS),
+            # retorna uma resposta padrao amigavel em vez de propagar erro (HTTP 500).
             try:
                 sql = self._generate_sql(question, request_id, question_scope["periods"], limite_usuario)
             except OutOfScopeQuestion as fora_escopo:
@@ -76,36 +82,22 @@ class _AskMixin(_ServiceBase):
                 }
             if re.search(r"\bdatasus_query_cache\b", sql, flags=re.IGNORECASE):
                 try:
-                    # Passa a SQL ao preparo do cache para habilitar a PROJEÇÃO
-                    # MÍNIMA (só as colunas usadas pela consulta) — reduz o
+                    # Passa a SQL ao preparo do cache para habilitar a PROJECAO
+                    # MINIMA (so as colunas usadas pela consulta) - reduz o
                     # volume materializado pelo UNION ALL dos 16 grupos e o pico
-                    # de memória (evita OOM), sem alterar o resultado.
+                    # de memoria (evita OOM), sem alterar o resultado.
                     cache_scope = self.cache.prepare_question_cache(question, request_id, sql=sql)
                 except (RuntimeError, ValueError) as cache_err:
-                    # >>> CORRECAO (pergunta SEM periodo): captura ValueError tambem. <<<
-                    # Antes, prepare_question_cache -> select_groups_periods_for_question
-                    # -> _parse_periods levantava ValueError("Informe a pergunta um
-                    # ano, mes...") para perguntas SEM periodo (ex.: "cids M05,M06,M10").
-                    # Como aqui so havia `except RuntimeError`, a excecao ESCAPAVA e
-                    # derrubava a requisicao com HTTP 500 -- MESMO com CIDs VALIDOS.
-                    # Agora capturamos ValueError e caímos no fallback de "todos os
-                    # periodos disponiveis", deixando a consulta rodar.
-                    LOGGER.warning("prepare_question_cache falhou (%s): %s. Tentando com todos os períodos.",
-                                   type(cache_err).__name__, cache_err)
-                    all_periods = {(year, month) for _, year, month in self.cache._indexed_parquet_records()}
-                    if not all_periods:
-                        raise RuntimeError("Não há dados de períodos disponíveis no cache para preparar a consulta.")
-                    # Usa prepare_question_cache com todos os períodos disponíveis
-                    # Não precisamos preparar de novo - apenas criamos a view
-                    self.cache.prepare_question_cache(question, request_id, sql=sql)
-                    cache_scope = {"files": len(all_periods), "names": [], "periods": all_periods}
+                    LOGGER.error("prepare_question_cache falhou (%s): %s",
+                                 type(cache_err).__name__, cache_err)
+                    raise
             else:
                 # >>> FASE 1 (S4): ATALHO DOS RESUMOS <<<
-                # A SQL do LLM usa SOMENTE as tabelas agregadas resumo_* e NÃO
+                # A SQL do LLM usa SOMENTE as tabelas agregadas resumo_* e NAO
                 # referencia datasus_query_cache. Nesse caso PULAMOS a
-                # materialização do UNION ALL dos grupos (etapa mais cara de
+                # materializacao do UNION ALL dos grupos (etapa mais cara de
                 # prepare_question_cache) e respondemos direto dos resumos, que
-                # já estão agregados. Isso reduz perguntas de contagem
+                # ja estao agregados. Isso reduz perguntas de contagem
                 # (por CID/sexo/ano) de minutos para milissegundos.
                 cache_scope = question_scope
                 LOGGER.info(
@@ -115,14 +107,14 @@ class _AskMixin(_ServiceBase):
             try:
                 rows = self.cache.execute(sql, request_id, limite=limite_usuario)
             except Exception as exec_err:
-                # >>> MELHORIA: Se a execução falhar no DuckDB, reenvia ao LLM para refazer a query <<<
+                # >>> MELHORIA: Se a execucao falhar no DuckDB, reenvia ao LLM para refazer a query <<<
                 LOGGER.warning(
                     "execução SQL falhou no DuckDB: %s. Reenviando query ao LLM para refazer. request_id=%s",
                     exec_err,
                     request_id,
                 )
                 # Em modo grupos, schema_context("datasus") fica vazio: fazemos
-                # fallback para a união das colunas de todos os grupos para que
+                # fallback para a uniao das colunas de todos os grupos para que
                 # o LLM receba o schema real ao refazer a query.
                 contexto_schema = self.cache.schema_context("datasus", include_examples=False)
                 real_cols_exec = [item["column"] for item in contexto_schema.get("columns", [])]
@@ -143,7 +135,7 @@ class _AskMixin(_ServiceBase):
                     real_columns=real_cols_exec,
                     motivo=str(exec_err),
                 )
-                # Aplica as correções pós-processamento
+                # Aplica as correcoes pos-processamento
                 sql_refeita = self._fix_unterminated_strings(sql_refeita)
                 sql_refeita = self._fix_incomplete_sql(sql_refeita, question, request_id, cache_scope.get("periods", set()), limite_usuario)
                 try:
@@ -151,11 +143,11 @@ class _AskMixin(_ServiceBase):
                 except ValueError:
                     LOGGER.error("SQL refeita ainda é inválida. Usando fallback. request_id=%s", request_id)
                     raise
-                # >>> CORREÇÃO A (colunas ausentes na temp table) <<<
+                # >>> CORRECAO A (colunas ausentes na temp table) <<<
                 # A SQL refeita pode referenciar colunas DIFERENTES das que
                 # foram materializadas na primeira chamada de
                 # prepare_question_cache (ex.: trocar CIDASSOC por DIAG_PRINC).
-                # Sem repreparar, a temp table não teria a nova coluna e o
+                # Sem repreparar, a temp table nao teria a nova coluna e o
                 # DuckDB falharia com:
                 #   Binder Error: Referenced column "DIAG_PRINC" not found
                 #   Candidate bindings: "ANO_CMPT", "CIDASSOC"
@@ -171,19 +163,19 @@ class _AskMixin(_ServiceBase):
                             "mantendo cache atual. request_id=%s",
                             prep_err, request_id,
                         )
-                # >>> CORREÇÃO G: cast de colunas CRUAS de ano na SQL refeita. <<<
+                # >>> CORRECAO G: cast de colunas CRUAS de ano na SQL refeita. <<<
                 sql_refeita = self._fix_raw_year_casts(sql_refeita, request_id)
-                # >>> CORREÇÃO I: cast de atend_ano (VARCHAR->INTEGER) em
-                # comparações numéricas (BETWEEN, =, IN com inteiros...). <<<
+                # >>> CORRECAO I: cast de atend_ano (VARCHAR->INTEGER) em
+                # comparacoes numericas (BETWEEN, =, IN com inteiros...). <<<
                 sql_refeita = self._fix_atend_ano_casts(sql_refeita, request_id)
-                # >>> CORREÇÃO DATA: remove funções de data do sistema na refeita. <<<
+                # >>> CORRECAO DATA: remove funcoes de data do sistema na refeita. <<<
                 sql_refeita = self._fix_system_date_functions(sql_refeita, request_id)
                 rows = self.cache.execute(sql_refeita, request_id, limite=limite_usuario)
                 sql = sql_refeita
             if not rows:
-                # >>> CORREÇÃO B: um resultado vazio é resposta LEGÍTIMA. Falhas na
-                # revisão semântica (ex.: APITimeoutError do Ollama) NÃO devem
-                # derrubar a requisição com HTTP 500; seguimos com 0 linhas.
+                # >>> CORRECAO B: um resultado vazio e resposta LEGITIMA. Falhas na
+                # revisao semantica (ex.: APITimeoutError do Ollama) NAO devem
+                # derrubar a requisicao com HTTP 500; seguimos com 0 linhas.
                 try:
                     sql, rows = self._review_empty_result(question, sql, request_id)
                 except Exception as review_err:
@@ -194,7 +186,7 @@ class _AskMixin(_ServiceBase):
                     )
                     rows = []
             answer = self._summarize(question, sql, rows, request_id)
-            # Segunda interação: usar o módulo llm_grafic para gerar gráfico dinâmico via LLM
+            # Segunda interacao: usar o modulo llm_grafic para gerar grafico dinamico via LLM
             chart = self.llm_grafic.gerar_grafico_llm(rows, question, tipo_grafico=tipo_grafico)
             if chart is None:
                 LOGGER.info("llm_grafic retornou None; usando gráfico padrão")
@@ -202,13 +194,13 @@ class _AskMixin(_ServiceBase):
                 chart = gerar_grafico_barras(rows, limite=limite_usuario, periodos=cache_scope.get("periods"))
             LOGGER.info("question complete request_id=%s source=llm rows=%d duration_ms=%.2f", request_id, len(rows), (time.perf_counter() - started) * 1000)
             return {"answer": answer, "results": rows, "sql": sql, "source": "LLM + DuckDB", "cache": cache_scope, "chart": chart, "tipo_grafico": tipo_grafico}
-        cache_scope = self.cache.question_scope(question)
+        cache_scope = self._question_scope(question)
         sql = self._heuristic_sql(question, limite_usuario)
         if re.search(r"\bdatasus_query_cache\b", sql, flags=re.IGNORECASE):
             cache_scope = self.cache.prepare_question_cache(question, request_id, sql=sql)
         rows = self.cache.execute(sql, request_id, limite=limite_usuario)
         answer = self._format_local_answer(question, rows)
-        # Segunda interação: usar o módulo llm_grafic para gerar gráfico dinâmico via LLM
+        # Segunda interacao: usar o modulo llm_grafic para gerar grafico dinamico via LLM
         chart = self.llm_grafic.gerar_grafico_llm(rows, question, tipo_grafico=tipo_grafico) if self.llm_grafic else None
         if chart is None:
             from graficos import gerar_grafico_barras
@@ -218,6 +210,7 @@ class _AskMixin(_ServiceBase):
 
 
     def _heuristic_sql(self, question: str, limite: int = 100) -> str:
+        """Monta uma SQL de contagem simples sem LLM (fallback local)."""
         schema = self.cache.schema_context("datasus_query_cache", include_examples=False)["columns"]
         columns = {item["column"].upper(): item["column"] for item in schema}
         normalized_question = question.casefold()
@@ -261,6 +254,7 @@ class _AskMixin(_ServiceBase):
         return f"SELECT COUNT(*) AS registros_encontrados FROM datasus_query_cache WHERE {predicates}"
 
     def _format_local_answer(self, question: str, rows: list[dict[str, Any]]) -> str:
+        """Formata as linhas do fallback local em texto legivel."""
         if not rows:
             return "Nenhum resultado foi encontrado no cache local."
         return (

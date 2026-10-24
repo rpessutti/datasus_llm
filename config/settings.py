@@ -38,9 +38,16 @@ load_dotenv(PROJECT_DIR / ".env")
 
 
 class Settings:
-    _data_dir_raw = os.getenv("DATASUS_DATA_DIR", f"D:\datasus\cache\parquet")
-    _cache_dir_raw = os.getenv("DATASUS_TEMP_CACHE_DIR", f"D:\datasus\cache")
-    _official_cache_dir_raw = os.getenv("DATASUS_OFFICIAL_CACHE_DIR", f"D:\datasus\cache")
+    """Configurações globais lidas do ambiente (``.env`` e variáveis ``DATASUS_*``).
+
+    Concentra os caminhos de dados/cache e os limites do DuckDB
+    (``memory_limit``, ``threads``, ``temp_dir``) usados pela conexão principal e
+    pelos bancos de grupo — ver ``PLANO_PERFORMANCE_CACHE.md``.
+    """
+
+    _data_dir_raw = os.getenv("DATASUS_DATA_DIR", r"D:\datasus\cache\parquet")
+    _cache_dir_raw = os.getenv("DATASUS_TEMP_CACHE_DIR", r"D:\datasus\cache")
+    _official_cache_dir_raw = os.getenv("DATASUS_OFFICIAL_CACHE_DIR", r"D:\datasus\cache")
 
     data_dir = Path(_clean_path(_data_dir_raw)).expanduser()
     cache_dir = Path(_clean_path(_cache_dir_raw)).expanduser()
@@ -66,11 +73,14 @@ class Settings:
     database_path = cache_dir / "datasus.duckdb"
 
     # DuckDB
-    memory_limit = os.getenv("DATASUS_MEMORY_LIMIT", "8GB")
-    threads = int(os.getenv("DATASUS_THREADS", "8"))
+    # PLANO_PERFORMANCE_CACHE.md, Etapas 1-2: 16 threads e 20 GB (~63% da RAM)
+    # reduzem o spill; `temp_dir` fica num DISCO SEPARADO do banco (padrao
+    # C:\datasus_spill) para o DuckDB nao competir consigo mesmo na mesma fila I/O.
+    memory_limit = os.getenv("DATASUS_MEMORY_LIMIT", "20GB")
+    threads = int(os.getenv("DATASUS_THREADS", "16"))
     _temp_dir_raw = os.getenv(
         "DATASUS_TEMP_DIR",
-        "/tmp" if os.name != "nt" else str(PROJECT_DIR / ".spill"),
+        "/tmp" if os.name != "nt" else r"C:\datasus_spill",
     )
     temp_dir = Path(_clean_path(_temp_dir_raw)).expanduser()
     if not temp_dir.is_absolute():

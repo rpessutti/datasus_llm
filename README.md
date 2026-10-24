@@ -10,15 +10,15 @@ pip install -r requirements.txt
 mkdir -p data
 ```
 
-Coloque os arquivos `.parquet` em `data/` (subdiretórios também são lidos). A aplicação valida cada arquivo, copia arquivos novos ou alterados para `cache/parquet/` e materializa os dados válidos na tabela DuckDB persistente `datasus_cache`, exposta pela view `datasus`.
+Coloque os arquivos `.parquet` em `data/` (subdiretórios também são lidos). A aplicação valida cada arquivo e o ingere no banco DuckDB do **grupo** correspondente (`<grupo>.datasus_cache`, exposto pela view `<grupo>.datasus`).
 
-Quando já existe um cache persistido, a aplicação ativa a API imediatamente. A primeira carga de um cache vazio ocorre em segundo plano; durante esse período, o status informa que o cache está carregando e as perguntas aguardam a conclusão.
+Quando já existe um cache persistido, a aplicação ativa a API imediatamente; grupos ausentes/incompletos são ingeridos de forma síncrona na inicialização (`ensure_ready_sync`) e o `/api/status` informa o progresso.
 
-Arquivos Parquet corrompidos são registrados no log, removidos da pasta de origem e do cache, e não interrompem os demais arquivos. Depois da primeira carga, se o manifesto (nome, tamanho e data de modificação) não mudou, a aplicação reutiliza `datasus_cache` e não relê os Parquet na inicialização.
+Arquivos Parquet corrompidos são registrados no log e ignorados, sem interromper os demais. O progresso por grupo fica em `group_checkpoint`/`file_manifest` (dentro do banco do grupo) e é retomável.
 
 ## Modo grupos e view unificada (UNION)
 
-Além do modo legado (uma única tabela `datasus_cache`), a aplicação suporta um **modo grupos**: cada grupo do DATASUS (ex.: `er`, `si`, `ps`, `sp`) vive em seu próprio banco anexado (`<grupo>.datasus_cache`). Para consultar todos ao mesmo tempo, a aplicação materializa a **view unificada** `datasus_query_cache` como um `UNION ALL` dos grupos selecionados para a pergunta.
+A aplicação usa **modo grupos**: cada grupo do DATASUS (ex.: `er`, `ps`, `sp`) vive em seu próprio banco anexado (`<grupo>.datasus_cache`). Para consultar todos ao mesmo tempo, a aplicação materializa a **view unificada** `datasus_query_cache` como um `UNION ALL` dos grupos selecionados para a pergunta.
 
 Decisões de projeto relevantes ao modo grupos:
 
@@ -32,6 +32,46 @@ Outras otimizações aplicadas:
 - **#1 — Qualificação de SQL por parser**: a qualificação de colunas/relações no SQL gerado é feita com uma abordagem estrutural (sem regex arriscada), evitando reescritas incorretas.
 - **#7 — Prefixos de CID pré-computados**: os prefixos de CID reais presentes nos dados são pré-computados na ingestão (tabela `cid_prefixes`) e apenas lidos nas consultas, em vez de escanear colunas de diagnóstico a cada pergunta.
 - **#8/#9/#10 — LIMIT/ORDER BY/projeção mínima**: `execute` respeita o limite da pergunta (fallback `DEFAULT_FETCH_ROWS`); o fallback de coluna ausente reconstrói a view com projeção **mínima** (colunas usadas ∪ faltante), não com todas as colunas; e o prompt do LLM exige `ORDER BY` em toda query com `LIMIT` (resultados reproduzíveis com `preserve_insertion_order=false`).
+
+## Catálogo de grupos e módulos do cache
+
+O catálogo vive no banco principal (`datasus.duckdb`) e substitui a descoberta por glob + sondas por grupo:
+
+- `group_registry` — nome, caminho do banco, pasta de origem, campo de período, `files`, `rows_est` e `status`.
+- `group_periods` — `(grupo, atend_ano, atend_mes)` publicados no `finalize` de cada grupo.
+- `ingest_log` — histórico de ingestões.
+
+`DatasusCache.sync_groups()` reconcilia o catálogo com o disco; `groups_needing_ingest()` compara `files` com os Parquet da origem; `periods_for_question()` resolve o recorte com **uma** consulta ao catálogo (sem `SELECT DISTINCT` por grupo).
+
+Módulos extraídos (responsabilidade única):
+
+| Módulo | Responsabilidade |
+|---|---|
+| `db/group_registry.py` | DDL, sincronização e leitura do catálogo |
+| `db/period_parser.py` | parsing de períodos na pergunta (`parse_periods`, `wants_monthly_grouping`) |
+| `db/sql_repair.py` | reparo/validação do SQL gerado |
+| `db/summary.py` | tabelas `resumo_*` (leem as tabelas dos grupos, não Parquet) |
+| `db/cid_prefixes.py` | prefixos de CID e carga do `cid10` |
+| `db/unified_view.py` | SQL do `UNION ALL` da view unificada |
+
+Aliases temporários mantidos para compatibilidade: `DatasusCache.columns` (`get_grupo_columns`), `DatasusCache._summary_tables` (`summary_tables`), `_GroupCache.scalar` (`_scalar`), `_GroupCache.ensure` (`reopen`) e `_GroupCache.period_index` (`_refresh_period_index`).
+
+Operação:
+
+```bash
+# limpa o legado do banco principal e publica o catálogo (F5.5)
+python -u dev_tools/migrate_group_catalog.py --limpar-legado --backfill
+
+# reconstrói a tabela de um grupo a partir dos Parquet (longo; já cria
+# atend_ano/atend_mes derivados do campo nativo de período)
+python -u dev_tools/rebuild_group_cache.py <grupo>
+```
+
+Caches legados sem as colunas físicas `atend_ano`/`atend_mes` são migrados **in
+place** apenas até `DATASUS_MIGRATE_MAX_ROWS` linhas (padrão 5.000.000). Acima
+disso a migração é desativada no boot (o backfill reescreveria a tabela inteira)
+e o grupo precisa ser reconstruído com o comando acima; até lá, a view unificada
+usa o campo nativo de período do grupo.
 
 ## Robustez contra disco removível (USB / HD externo)
 

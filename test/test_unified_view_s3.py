@@ -67,16 +67,17 @@ class DatasusCacheS3Test(unittest.TestCase):
 
     def _cache(self) -> DatasusCache:
         c = DatasusCache(_FakeSettings(self.data, self.cache))
-        c._discover_groups()
+        c.sync_groups()
         for group in c.groups.values():
             group.reopen()
             group.ingest()
         return c
 
-    def test_flag_ligada(self) -> None:
+    def test_grupos_registrados(self) -> None:
+        """O cache descobre os grupos (a view unificada e sempre montada)."""
         c = DatasusCache(_FakeSettings(self.data, self.cache))
         try:
-            self.assertTrue(c._unified_view_enabled)
+            self.assertIn("er", c.groups)
         finally:
             c.close()
 

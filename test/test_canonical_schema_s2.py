@@ -8,12 +8,11 @@ colunas A CADA pergunta. O schema é memoizado em ``_canonical_schema_cache`` e
 invalidado em mudanças estruturais (nova ingestão, (re)descoberta de grupos).
 
 Cobre:
-1. _get_canonical_schema memoiza (segunda chamada não recomputa).
+1. canonical_schema memoiza (segunda chamada não recomputa).
 2. Colunas derivadas atend_ano/atend_mes sempre presentes.
 3. Metadados de arquivo (parquet_year/month, filename) NÃO entram.
-4. _invalidate_canonical_schema descarta o cache (próxima chamada recomputa).
-5. _ingest_locked invalida o schema ao final da ingestão.
-6. grupo VIEW (S1) também aparece no schema canônico.
+4. invalidate_schema descarta o cache (próxima chamada recomputa).
+5. ingest invalida o schema ao final da ingestão.
 """
 
 
@@ -62,7 +61,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
 
     def _cache(self) -> DatasusCache:
         c = DatasusCache(_FakeSettings(self.data, self.cache))
-        c._discover_groups()
+        c.sync_groups()
         for group in c.groups.values():
             group.reopen()
             group.ingest()
@@ -71,7 +70,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
     def test_memoiza(self) -> None:
         c = self._cache()
         try:
-            all_cols, group_cols = c._get_canonical_schema()
+            all_cols, group_cols = c.canonical_schema()
             # Após a primeira chamada o cache deve estar preenchido.
             self.assertIsNotNone(c._canonical_schema_cache)
             self.assertEqual(group_cols, c._canonical_schema_cache["group_columns"])
@@ -79,7 +78,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
             # Marca o cache e confirma que uma segunda chamada devolve o MESMO objeto
             # (não recomputa).
             sentinel = c._canonical_schema_cache
-            all_cols2, group_cols2 = c._get_canonical_schema()
+            all_cols2, group_cols2 = c.canonical_schema()
             self.assertIs(c._canonical_schema_cache, sentinel)
             self.assertEqual(all_cols, all_cols2)
             self.assertEqual(group_cols, group_cols2)
@@ -89,7 +88,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
     def test_colunas_derivadas_presentes(self) -> None:
         c = self._cache()
         try:
-            all_cols, _ = c._get_canonical_schema()
+            all_cols, _ = c.canonical_schema()
             self.assertIn(ATEND_ANO, all_cols)
             self.assertIn(ATEND_MES, all_cols)
         finally:
@@ -98,7 +97,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
     def test_metadados_arquivo_ausentes(self) -> None:
         c = self._cache()
         try:
-            all_cols, group_cols = c._get_canonical_schema()
+            all_cols, group_cols = c.canonical_schema()
             for meta in ("parquet_year", "parquet_month", "filename", "parquet_path"):
                 self.assertNotIn(meta, all_cols)
                 for cols in group_cols.values():
@@ -109,15 +108,15 @@ class CanonicalSchemaS2Test(unittest.TestCase):
     def test_invalidacao_recomputa(self) -> None:
         c = self._cache()
         try:
-            c._get_canonical_schema()
+            c.canonical_schema()
             sentinel = c._canonical_schema_cache
             self.assertIsNotNone(sentinel)
 
-            c._invalidate_canonical_schema()
+            c.invalidate_schema()
             self.assertIsNone(c._canonical_schema_cache)
 
             # A próxima chamada recomputa (novo objeto, conteúdo equivalente).
-            all_cols, _ = c._get_canonical_schema()
+            all_cols, _ = c.canonical_schema()
             self.assertIsNotNone(c._canonical_schema_cache)
             self.assertIsNot(c._canonical_schema_cache, sentinel)
             self.assertIn(ATEND_ANO, all_cols)
@@ -128,11 +127,11 @@ class CanonicalSchemaS2Test(unittest.TestCase):
         c = self._cache()
         try:
             # Pré-popula o cache com um valor sentinela.
-            c._get_canonical_schema()
+            c.canonical_schema()
             c._canonical_schema_cache = {"__sentinel__": True}
 
-            # _ingest_locked deve invalidar ao final (mesmo sem arquivos novos).
-            c._ingest_locked(started=0.0)
+            # ingest deve invalidar ao final (mesmo sem arquivos novos).
+            c.ingest()
             self.assertIsNone(c._canonical_schema_cache)
         finally:
             c.close()
@@ -144,7 +143,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
         consultas a ``duckdb_tables``/``duckdb_views`` para decidir se o grupo
         entrava. Agora ele reaproveita o cache S2 (memoizado).
 
-        Estratégia: aquecemos o S2 (``_get_canonical_schema``) e então contamos
+        Estratégia: aquecemos o S2 (``canonical_schema``) e então contamos
         quantas queries a ``duckdb_tables``/``duckdb_views`` são emitidas durante
         ``prepare_question_cache``. Com o S2 quente, devem ser ZERO.
 
@@ -155,7 +154,7 @@ class CanonicalSchemaS2Test(unittest.TestCase):
         c = self._cache()
         try:
             # Aquece o cache S2 (baseline).
-            c._get_canonical_schema()
+            c.canonical_schema()
             self.assertIsNotNone(c._canonical_schema_cache)
 
             catalog_hits = {"tables": 0, "views": 0}

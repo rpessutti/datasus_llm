@@ -19,7 +19,7 @@ LOGGER = logging.getLogger("datasus_llm")
 
 settings = Settings()
 
-# IMPORTANTE: Inicializa o cache com proteção contra falhas.
+# IMPORTANTE: Inicializa o cache com protecao contra falhas.
 try:
     cache = DatasusCache(settings)
 except Exception as e:
@@ -44,46 +44,25 @@ except Exception as e:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Inicialização síncrona: lê e cacheia os Parquet antes de servir requisições."""
+    """Inicializacao sincrona: le e cacheia os Parquet antes de servir requisicoes."""
     error = None
     try:
         db_exists = cache.database_path.exists()
-        cache_ready = cache._cache_table_exists()
-        LOGGER.info("Sincronização síncrona do cache iniciada. db_exists=%s cache_ready=%s grupos=%s",
-                    db_exists, cache_ready, list(cache.groups))
+        LOGGER.info("Sincronização síncrona do cache iniciada. db_exists=%s grupos=%d",
+                    db_exists, len(cache.groups))
 
         try:
-            if not cache.groups:
-                # Modo legado (sem grupos): ingere apenas se o cache principal
-                # ainda não tiver sido materializado.
-                need_ingest = not cache._cache_table_exists()
-                if need_ingest:
-                    LOGGER.info("Cache principal ausente; executando ingestão...")
-                    cache.ingest()
-                else:
-                    LOGGER.info("Cache principal já completo; pulando ingestão.")
-            else:
-                # >>> CORREÇÃO: ingestão SÍNCRONA e AUTOMÁTICA por grupo.
-                #
-                # detecta os grupos cujo cache DuckDB está ausente OU incompleto
-                # (parquets faltantes) e executa a ingestão COMPLETA, bloqueando a
-                # inicialização até que TODOS os grupos estejam prontos. Se, ao
-                # final, ainda houver pendências, o método levanta RuntimeError,
-                # o que faz a app subir em estado de erro (503 em /api/ask) em vez
-                # de servir dados incompletos.
-                cache.ensure_ready_sync()
+            # Ingestao SINCRONA e AUTOMATICA por grupo: detecta os grupos cujo
+            # cache DuckDB esta ausente OU incompleto (parquets faltantes) e
+            # executa a ingestao completa, bloqueando a inicializacao ate que
+            # todos estejam prontos. Pendencias remanescentes levantam
+            # RuntimeError (a app sobe em estado de erro e /api/ask responde
+            # 503 em vez de servir dados incompletos).
+            cache.ensure_ready_sync()
         except Exception as ingest_exc:
             LOGGER.error("Erro na ingestão durante inicialização: %s", ingest_exc)
             error = str(ingest_exc)
-
-        try:
-            if not cache.groups and cache._cache_table_exists() and not cache._datasus_view_exists():
-                cache.connection.execute("CREATE VIEW datasus AS SELECT * FROM datasus_cache")
-        except Exception as view_exc:
-            LOGGER.warning("erro ao criar view datasus: %s", view_exc)
-            if error is None:
-                error = str(view_exc)
-        LOGGER.info("Sincronização do cache conluída (ou com erros tratados).")
+        LOGGER.info("Sincronização do cache concluída (ou com erros tratados).")
     except Exception as exc:
         LOGGER.exception("Falha geral na sincronização do cache na inicialização")
         error = str(exc)
@@ -110,16 +89,19 @@ app = FastAPI(title="DATASUS LLM", version="1.0.0", lifespan=lifespan)
 
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
+    """Entrega a pagina HTML do assistente."""
     return FileResponse(Path(__file__).resolve().parent.parent / "static" / "index.html")
 
 
 @app.get("/api/status")
 def api_status() -> dict[str, Any]:
+    """Retorna o estado do cache (grupos, linhas estimadas, resumos)."""
     return cache.status()
 
 
 @app.post("/api/ingest")
 def api_ingest() -> dict[str, Any]:
+    """Executa a ingestao dos grupos e reconstroi os resumos."""
     result = cache.ingest(build_summary=True)
     cache.mark_ready()
     return result
@@ -127,12 +109,14 @@ def api_ingest() -> dict[str, Any]:
 
 @app.api_route("/api/build-indexes", methods=["GET", "POST"])
 def api_build_indexes(request: Request) -> dict[str, Any]:
+    """Reconstroi as tabelas agregadas ``resumo_*`` (GET ou POST)."""
     LOGGER.info("build indexes requested method=%s", request.method)
     return cache.build_summary_tables()
 
 
 @app.post("/api/ask")
 def api_ask(payload: Question) -> dict[str, Any]:
+    """Responde uma pergunta em linguagem natural sobre os dados do cache."""
     status = cache.status()
     if not cache.is_ready():
         detail = cache.startup_status() or "O cache ainda está sendo carregado. Tente novamente em instantes."

@@ -105,19 +105,12 @@ def criar_mock_llm_recusa_escopo(mensagem: str = "") -> MagicMock:
 def criar_cache_mock() -> MagicMock:
     """Cria um cache mockado com valores padrao para permitir que o fluxo continue."""
     fake_cache = MagicMock()
-    fake_cache.question_scope.return_value = {
-        "files": 5,
-        "names": ["arquivo1.parquet", "arquivo2.parquet"],
-        "periods": {("2024", "01")},
-    }
-    fake_cache._indexed_parquet_records.return_value = []
+    fake_cache.periods_for_question.return_value = [("sp", "2024", "01")]
     fake_cache.get_grupo_columns.return_value = {}
     fake_cache.schema_context.return_value = {"columns": []}
+    fake_cache.summary_tables.return_value = []
     fake_cache._summary_tables.return_value = []
     fake_cache.groups = {"sp": "sp", "rj": "rj"}
-    fake_cache.select_files_for_question.return_value = [
-        SimpleNamespace(parts=("cache", "sp", "arquivo.parquet"))
-    ]
     return fake_cache
 
 

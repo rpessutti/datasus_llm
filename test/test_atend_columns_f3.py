@@ -18,28 +18,22 @@ Cobre os checkpoints internos da PARTE 3:
     recorte temporal continua correto.
   * Grupo SEM campo de período mapeado permanece sem as colunas.
 
-IMPORTANTE: este módulo roda em modo TABELA (o oposto do S1). O modo é forçado
-por teste em setUp/tearDown (a flag DATASUS_CACHE_AS_VIEW é restaurada ao final),
-já que _cache_as_view_enabled() lê a variável em tempo de chamada e o import em
-si não deve vazar estado global para outros módulos de teste.
+IMPORTANTE: este modulo roda em modo TABELA (o antigo modo VIEW/S1 foi
+removido). A ingestao sempre materializa a tabela ``<grupo>.datasus_cache``.
 """
 
-import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import duckdb
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-# NÃO mexemos no ambiente aqui no import (isso vazaria para outros módulos de
-# teste, ex.: o S1, que exige DATASUS_CACHE_AS_VIEW=true). O modo TABELA é
-# garantido POR TESTE em setUp/tearDown, já que _cache_as_view_enabled() lê a
-# variável em tempo de chamada.
 from db.cache import DatasusCache  # noqa: E402
 from db.group_cache import _GroupCache  # noqa: E402
 
@@ -64,9 +58,6 @@ def _make_parquet(path: Path, dtype_col: str, dt: int, cid: str) -> None:
 
 class AtendColumnsF3Test(unittest.TestCase):
     def setUp(self) -> None:
-        # Força modo TABELA apenas DURANTE este teste (restaura em tearDown).
-        self._prev_view_flag = os.environ.get("DATASUS_CACHE_AS_VIEW")
-        os.environ["DATASUS_CACHE_AS_VIEW"] = "false"
         self.tmp = Path(tempfile.mkdtemp(prefix="f3_atend_"))
         self.data = self.tmp / "data"
         self.cache = self.tmp / "cache"
@@ -75,16 +66,11 @@ class AtendColumnsF3Test(unittest.TestCase):
         _make_parquet(self.data / "er" / "2022" / "05" / "ER2205.parquet", "DT_INTER", 20220510, "B05")
 
     def tearDown(self) -> None:
-        # Restaura o valor anterior da flag para não vazar entre módulos de teste.
-        if self._prev_view_flag is None:
-            os.environ.pop("DATASUS_CACHE_AS_VIEW", None)
-        else:
-            os.environ["DATASUS_CACHE_AS_VIEW"] = self._prev_view_flag
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _cache(self) -> DatasusCache:
         c = DatasusCache(_FakeSettings(self.data, self.cache))
-        c._discover_groups()
+        c.sync_groups()
         return c
 
     def _ingest_all(self, c: DatasusCache) -> None:
@@ -305,6 +291,68 @@ class AtendColumnsF3Test(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+        finally:
+            c.close()
+
+    # ------------------------------------------------------------------ #
+    # Migração in-place é bloqueada acima de MIGRATE_MAX_ROWS
+    # ------------------------------------------------------------------ #
+    def test_migracao_in_place_bloqueada_acima_do_limite(self) -> None:
+        """Com o limite em 0, um cache legado NÃO recebe as colunas de período.
+
+        Evita que uma tabela gigante (ex.: `bi`, 929 M linhas) seja reescrita
+        dentro do boot: nesse caso o grupo precisa de rebuild.
+        """
+        c = self._cache()
+        try:
+            self._ingest_all(c)
+            er = c.groups["er"]
+            er.reopen()
+            er.connection.execute("ALTER TABLE er.datasus_cache DROP COLUMN atend_ano")
+            er.connection.execute("ALTER TABLE er.datasus_cache DROP COLUMN atend_mes")
+
+            with mock.patch("db.group_cache.MIGRATE_MAX_ROWS", 0):
+                er._migrate_period_columns()
+
+            cols = {
+                r[0].lower()
+                for r in er.connection.execute("DESCRIBE er.datasus_cache").fetchall()
+            }
+            self.assertNotIn("atend_ano", cols)
+            self.assertNotIn("atend_mes", cols)
+        finally:
+            c.close()
+
+    # ------------------------------------------------------------------ #
+    # finalize: view datasus + period_index (sem varredura de integridade)
+    # ------------------------------------------------------------------ #
+    def test_finalize_publica_view_e_indice_de_periodo(self) -> None:
+        """finalize(verify_period=False) cria a view e o índice de período."""
+        c = self._cache()
+        try:
+            self._ingest_all(c)
+            er = c.groups["er"]
+            er.reopen()
+            er.finalize(verify_period=False)
+
+            views = {
+                r[0]
+                for r in er.connection.execute(
+                    "SELECT view_name FROM duckdb_views() WHERE view_name = 'datasus'"
+                ).fetchall()
+            }
+            self.assertIn("datasus", views)
+            periodos = er.connection.execute(
+                "SELECT parquet_year, parquet_month FROM er.period_index"
+            ).fetchall()
+            self.assertEqual(periodos, [("2022", "05")])
+
+            # O catalogo publica o numero de ARQUIVOS cacheados (nao linhas do
+            # manifesto) - base do `groups_needing_ingest`.
+            files = er.connection.execute(
+                "SELECT files FROM group_registry WHERE name = 'er'"
+            ).fetchone()[0]
+            self.assertEqual(files, 1)
         finally:
             c.close()
 

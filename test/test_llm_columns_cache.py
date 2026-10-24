@@ -312,18 +312,17 @@ class TestDetermineRelevantGrupos(ColumnCacheTestBase):
         except Exception as e:
             self.fail(f"Erro ao chamar _determine_relevant_grupos: {e}")
 
-    def test_returns_legacy_when_no_grupos(self):
-        """Sem grupos, deve retornar ['_legacy']."""
-        # Mock: cache sem grupos
+    def test_returns_vazio_quando_sem_grupos(self):
+        """Sem grupos registrados, deve retornar lista vazia."""
         mock_cache = MagicMock()
         mock_cache.groups = {}
-        mock_cache.select_files_for_question.side_effect = Exception("sem dados")
-        
+        mock_cache.periods_for_question.return_value = []
+
         service = LLMQueryService.__new__(LLMQueryService)
         service.cache = mock_cache
-        
+
         grupos = service._determine_relevant_grupos("Alguma pergunta", {("2025", "01")})
-        self.assertEqual(grupos, ["_legacy"])
+        self.assertEqual(grupos, [])
 
 
 # ============================================================================

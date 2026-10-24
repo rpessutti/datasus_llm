@@ -38,6 +38,14 @@ try:  # usa o cache CONFIGURADO (ex.: D:\datasus\cache); fallback: <projeto>/cac
 except Exception:  # pragma: no cover - ambiente sem config.settings importavel
     CACHE_DIR = ROOT / "cache"
 
+from db.period_fields import (  # noqa: E402
+    ATEND_ANO,
+    ATEND_MES,
+    PERIOD_FIELDS,
+    ano_int_expr,
+    mes_expr,
+)
+
 
 def _parquet_files(group: str) -> list[Path]:
     """Lista os Parquet cacheados de um grupo (``<CACHE_DIR>/<grupo>/**.parquet``).
@@ -56,7 +64,12 @@ def rebuild_group(group: str, dry_run: bool) -> None:
 
     Cria a tabela VAZIA com o schema/colunas derivadas de período
     (``CREATE OR REPLACE TABLE ... LIMIT 0``) e insere os dados em lotes de 100
-    arquivos, com limite de memória e spill em disco. NÃO apaga os Parquet.
+    arquivos. NÃO apaga os Parquet.
+
+    Config do DuckDB (``PLANO_PERFORMANCE_CACHE.md``, Etapas 1-4): ``threads`` e
+    ``memory_limit`` padrão **16 / 20 GB**; spill em ``DATASUS_TEMP_DIR`` (padrao
+    ``C:\\datasus_spill``, **disco separado** do banco); ``preserve_insertion_order=false``;
+    ``checkpoint_threshold='4GB'``; e ``CHECKPOINT`` do grupo antes de fechar.
 
     Aviso: o conteúdo anterior da tabela é DESCARTADO (recriada do Parquet) —
     por isso é a via CARA; para remover apenas linhas duplicadas use
@@ -86,18 +99,47 @@ def rebuild_group(group: str, dry_run: bool) -> None:
     # porque o rebuild rodava sem limite de memória e sem spill em disco. Aqui
     # configuramos limite + diretório temporário para permitir a materialização
     # via spill (arquivos temporários), evitando o OOM que interrompia o processo.
+    # PLANO_PERFORMANCE_CACHE.md, Etapas 1-4: 16 threads / 20 GB; spill num DISCO
+    # SEPARADO do banco (padrao C:\datasus_spill); preserve_insertion_order=false
+    # (nao bufferiza/ordena o lote) e checkpoint_threshold de 4 GB.
     import os as _os
-    mem = _os.getenv("DATASUS_MEMORY_LIMIT", "4GB")
-    threads = _os.getenv("DATASUS_THREADS", "4")
-    spill = CACHE_DIR / "duckdb_spill"
+    mem = _os.getenv("DATASUS_MEMORY_LIMIT", "20GB")
+    threads = _os.getenv("DATASUS_THREADS", "16")
+    spill = Path(_os.getenv("DATASUS_TEMP_DIR", r"C:\datasus_spill"))
     try:
         spill.mkdir(parents=True, exist_ok=True)
         conn.execute(f"SET temp_directory='{spill}'")
         conn.execute(f"SET memory_limit='{mem}'")
         conn.execute(f"SET threads={threads}")
+        conn.execute("SET preserve_insertion_order=false")
+        conn.execute("SET checkpoint_threshold='4GB'")
     except Exception as exc:
         print(f"[{group}] aviso: não foi possível configurar memória/spill: {exc}")
     conn.execute(f"ATTACH '{db_path}' AS \"{group}\" (READ_WRITE)")
+
+    # Colunas FISICAS de periodo (FASE 3): derivadas do campo NATIVO do grupo.
+    # Criadas JA na reconstrucao para que `_GroupCache._migrate_period_columns`
+    # nao precise adiciona-las/backfillar depois (o que reescreveria a tabela
+    # inteira dentro do boot - ver MIGRATE_MAX_ROWS em db/group_cache.py).
+    ano_sql = mes_sql = None
+    periodo = PERIOD_FIELDS.get(group)
+    if periodo is not None:
+        primeiro = str(files[0]).replace("'", "''")
+        existentes = {
+            r[0].lower() for r in conn.execute(
+                f"DESCRIBE SELECT * FROM read_parquet(['{primeiro}']) LIMIT 0"
+            ).fetchall()
+        }
+        pcol = periodo.columns[0]
+        if pcol.lower() in existentes:
+            ano_sql = ano_int_expr(pcol)
+            mes_sql = mes_expr(pcol)
+    extra = (
+        f", {ano_sql} AS {ATEND_ANO}, {mes_sql} AS {ATEND_MES}"
+        if ano_sql and mes_sql else ""
+    )
+    if extra:
+        print(f"[{group}] colunas de periodo: {ATEND_ANO}/{ATEND_MES} a partir de {periodo.columns[0]}")
 
     # Materializa a tabela VAZIA com o schema e as colunas derivadas de período.
     first = str(files[0]).replace("'", "''")
@@ -108,6 +150,7 @@ def rebuild_group(group: str, dry_run: bool) -> None:
         "TRY_CAST(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 1) AS INTEGER)) AS parquet_year, "
         "COALESCE(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 2), ''), "
         "NULLIF(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 2), '')) AS parquet_month "
+        f"{extra} "
         f"FROM read_parquet(['{first}'], union_by_name = true, filename = true) LIMIT 0"
     )
 
@@ -149,6 +192,10 @@ def rebuild_group(group: str, dry_run: bool) -> None:
                     "COALESCE(NULLIF(regexp_extract(filename, '(\\d{2})(0[1-9]|1[0-2])[a-z]*\\.parquet$', 2), ''), "
                     "NULLIF(regexp_extract(filename, '/(\\d{4})/(0[1-9]|1[0-2])/', 2), '')) AS parquet_month"
                 )
+            elif col.lower() == ATEND_ANO and ano_sql is not None:
+                proj.append(f"{ano_sql} AS {ATEND_ANO}")
+            elif col.lower() == ATEND_MES and mes_sql is not None:
+                proj.append(f"{mes_sql} AS {ATEND_MES}")
             elif col.upper() in batch_by_upper:
                 bc = batch_by_upper[col.upper()].replace('"', '""')
                 proj.append(f'"{bc}"')
@@ -182,6 +229,8 @@ def rebuild_group(group: str, dry_run: bool) -> None:
         print(f"[{group}] ATENÇÃO: campos de metadados com NULL remanescentes "
               f"(verifique nomes de arquivo sem AAMM e pastas ano/mês)")
 
+    # Etapa 4 (PLANO_PERFORMANCE_CACHE.md): flush deterministico do banco do grupo.
+    conn.execute(f'CHECKPOINT "{group}"')
     conn.close()
     print(f"[{group}] OK")
 

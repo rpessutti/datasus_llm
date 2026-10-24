@@ -128,3 +128,5 @@ desktop.ini
 test/__pycache__/
 *.pyc
 
+# WIP do refactor (nunca versionar)
+*_new.py

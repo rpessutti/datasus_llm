@@ -64,7 +64,7 @@ def _montar_cache(tmp: Path):
     from db.cache import DatasusCache  # import tardio (depende do env)
 
     c = DatasusCache(_Settings(data, cache))
-    c._discover_groups()
+    c.sync_groups()
     for g in c.groups.values():
         g.reopen()
         g.ingest()

@@ -7,7 +7,7 @@ Cobrem as duas correções implementadas para a pergunta:
 
 Problemas corrigidos:
   1. NUMERO POR EXTENSO: "ultimos dois anos" nao era reconhecido (o regex exigia
-     digitos), fazendo select_files_for_question levantar ValueError.
+     digitos), fazendo a resolucao de periodos do cache falhar.
   2. AGRUPAMENTO != FILTRO: "agrupe por mes"/"por mes"/"mensal" era tratado como
      selecao de um mes especifico, zerando/prendendo o filtro de meses. Agora a
      intencao de agrupamento e propagada ao LLM e a coluna JA EXISTENTE
@@ -15,7 +15,7 @@ Problemas corrigidos:
 
 Estrutura:
   - Testes UNITARIOS (nao dependem de cache/LLM) para a deteccao de agrupamento.
-  - Testes de SELECAO DE ARQUIVOS (dependem do cache local; pulados se ausente).
+  - Testes de SELECAO DE PERIODOS (dependem do cache local; pulados se ausente).
   - Testes de INTEGRACAO: verificam que o prompt do LLM recebe a instrucao de
     agrupar por parquet_month (com cache real).
 
@@ -62,29 +62,22 @@ def _abrir_cache():
 
 
 def _selecionar_anos_meses(cache, pergunta: str):
-    """Resolve (anos, meses) para a pergunta, independentemente do modo.
+    """Resolve (anos, meses) para a pergunta a partir do catalogo de grupos.
 
-    Em MODO GRUPOS (os bancos <grupo>.duckdb existem), o app usa
-    ``select_groups_periods_for_question`` e as datas vem dos campos nativos
-    do DATASUS. Apenas quando NAO ha grupos (modo legado Parquet) usa
-    ``select_files_for_question`` e deriva o periodo do caminho do arquivo.
+    Usa ``DatasusCache.periods_for_question``, que le ``main.group_periods``.
+    Perguntas sem recorte interpretavel recebem todos os periodos disponiveis
+    (o parser registra um aviso e nao levanta excecao).
 
-    Retorna (anos: set[str], meses: set[str]). Levanta ValueError se a
-    selecao falhar.
+    Args:
+        cache: instancia de DatasusCache.
+        pergunta: pergunta do usuario.
+
+    Returns:
+        tuple[set[str], set[str]]: anos e meses no formato '01'..'12'.
     """
-    if cache.groups:
-        selecionados = cache.select_groups_periods_for_question(pergunta)
-        anos = {str(ano) for _, ano, _ in selecionados}
-        meses = {str(mes).zfill(2) for _, _, mes in selecionados}
-        return anos, meses
-    arquivos = cache.select_files_for_question(pergunta)
-    anos: set[str] = set()
-    meses: set[str] = set()
-    for path in arquivos:
-        periodo = cache._extract_period_from_path(path)
-        if periodo and len(periodo) >= 7:
-            anos.add(periodo[:4])
-            meses.add(periodo[-2:])
+    selecionados = cache.periods_for_question(pergunta)
+    anos = {str(ano) for _, ano, _ in selecionados}
+    meses = {str(mes).zfill(2) for _, _, mes in selecionados}
     return anos, meses
 
 
